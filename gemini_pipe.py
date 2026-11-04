@@ -26,6 +26,7 @@ v0.1.0
 import asyncio
 import base64
 import contextvars
+import copy
 import hashlib
 import html
 import inspect
@@ -381,6 +382,655 @@ except ImportError:
     get_image_base64_from_url = None
     IMAGE_URL_FETCH_AVAILABLE = False
 
+
+# =============================================================================
+# STREAM STATE (GENERATED SECTIONS) AND REQUEST CONTEXT
+# =============================================================================
+
+# BEGIN GENERATED SECTION: gemini_pipe.response.grounding
+def _camel(name: str) -> str:
+    """snake_case to camelCase (``start_index`` -> ``startIndex``)."""
+    head, *rest = name.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
+def _get(obj: Any, name: str) -> Any:
+    """Read an attribute or dict key by snake_case, falling back to camelCase."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        if name in obj:
+            return obj[name]
+        return obj.get(_camel(name))
+    value = getattr(obj, name, None)
+    if value is None:
+        value = getattr(obj, _camel(name), None)
+    return value
+
+
+def _normalize_chunk(chunk: Any) -> Optional[dict]:
+    web = _get(chunk, "web")
+    if web is not None:
+        return {
+            "kind": "web",
+            "uri": _get(web, "uri"),
+            "title": _get(web, "title"),
+            "domain": _get(web, "domain"),
+            "place_id": None,
+        }
+    maps = _get(chunk, "maps")
+    if maps is not None:
+        return {
+            "kind": "maps",
+            "uri": _get(maps, "uri"),
+            "title": _get(maps, "title"),
+            "domain": None,
+            "place_id": _get(maps, "place_id"),
+        }
+    return None
+
+
+def _chunk_key(chunk: dict) -> Optional[str]:
+    """A chunk's identity: its uri, falling back to its place id."""
+    if chunk.get("uri"):
+        return chunk["uri"]
+    if chunk.get("place_id"):
+        return str(chunk["place_id"])
+    return None
+
+
+@dataclass
+class GroundingAccumulator:
+    """Cumulative grounding state of one API call (chunks, supports, queries)."""
+
+    chunks: List[dict] = field(default_factory=list)
+    supports: List[dict] = field(default_factory=list)
+    queries: List[str] = field(default_factory=list)
+    entry_point_html: str = ""
+
+    def add(self, gm: Any) -> None:
+        """Merge one GroundingMetadata (SDK object or dict); None is ignored."""
+        if gm is None:
+            return
+        new_chunks = []
+        for chunk in _get(gm, "grounding_chunks") or []:
+            norm = _normalize_chunk(chunk)
+            if norm is not None and _chunk_key(norm) is not None:
+                new_chunks.append(norm)
+        if new_chunks:
+            current_keys = [_chunk_key(c) for c in self.chunks]
+            new_keys = [_chunk_key(c) for c in new_chunks]
+            if new_keys[: len(current_keys)] == current_keys:
+                # A cumulative snapshot of the same stream: replace, don't grow.
+                self.chunks = list(new_chunks)
+            else:
+                # Documented streaming behaviour: chunks arrive incrementally.
+                self.chunks.extend(new_chunks)
+        seen = {
+            (s["start"], s["end"], s["text"], tuple(s["indices"])) for s in self.supports
+        }
+        for support in _get(gm, "grounding_supports") or []:
+            segment = _get(support, "segment")
+            entry = {
+                "start": _get(segment, "start_index"),
+                "end": _get(segment, "end_index"),
+                "text": _get(segment, "text") or "",
+                "indices": list(_get(support, "grounding_chunk_indices") or []),
+            }
+            key = (entry["start"], entry["end"], entry["text"], tuple(entry["indices"]))
+            if key not in seen:
+                seen.add(key)
+                self.supports.append(entry)
+        for query in _get(gm, "web_search_queries") or []:
+            if query and query not in self.queries:
+                self.queries.append(query)
+        rendered = _get(_get(gm, "search_entry_point"), "rendered_content")
+        if rendered:
+            self.entry_point_html = rendered
+
+    def empty(self) -> bool:
+        return not self.chunks and not self.queries
+
+
+def locate_support_end(text_bytes: bytes, support: dict) -> Optional[int]:
+    """The byte offset where a support's segment actually ends in ``text_bytes``.
+
+    The API's end_index can be off by a few bytes, so a support that carries
+    its segment text is re-located; a text-less one is snapped forward over the
+    tail of a multi-byte UTF-8 sequence it may land inside.
+    """
+    text = support.get("text") or ""
+    end = support.get("end")
+    if text:
+        needle = text.encode("utf-8")
+        ends = []
+        start = 0
+        while True:
+            index = text_bytes.find(needle, start)
+            if index == -1:
+                break
+            ends.append(index + len(needle))
+            start = index + 1
+        if not ends:
+            return None
+        if end is None:
+            return ends[0]
+        return min(ends, key=lambda e: (abs(e - end), e))
+    if end is not None and 0 < end <= len(text_bytes):
+        pos = end
+        while pos < len(text_bytes) and (text_bytes[pos] & 0xC0) == 0x80:
+            pos += 1
+        return pos
+    return None
+
+
+def byte_to_char_index(text: str, byte_off: int) -> int:
+    """Map a UTF-8 byte offset into ``text`` onto a character index."""
+    return len(text.encode("utf-8")[:byte_off].decode("utf-8", "ignore"))
+
+
+def _fence_line_spans(text: str) -> List[Tuple[int, int]]:
+    """(line_start, position after the last backtick) of every ``` fence line."""
+    spans = []
+    offset = 0
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            spans.append((offset, offset + len(line)))
+        offset += len(line) + 1
+    return spans
+
+
+def _line_end(text: str, pos: int) -> int:
+    closer = text.find("\n", pos)
+    return closer + 1 if closer != -1 else len(text)
+
+
+def safe_insertion_point(text: str, pos: int) -> int:
+    """Move ``pos`` so a citation marker can't split code, spans or words."""
+    pos = max(0, min(int(pos), len(text)))
+    fences = _fence_line_spans(text)
+    opener = None
+    for span in fences:
+        if _line_end(text, span[1]) <= pos:
+            opener = span
+        else:
+            break
+    if opener is not None:
+        index = fences.index(opener) + 1
+        if index < len(fences):
+            return _line_end(text, fences[index][1])
+        return len(text)
+    if text[:pos].count("`") % 2 == 1:
+        closer = text.find("`", pos)
+        return closer + 1 if closer != -1 else len(text)
+    link = text.rfind("](", 0, pos)
+    if link != -1:
+        closer = text.find(")", link + 2)
+        if closer != -1 and closer >= pos:
+            return closer + 1
+    while pos > 0 and text[pos - 1] in " \t\r\n":
+        pos -= 1
+    if 0 < pos < len(text) and text[pos - 1].isalnum() and text[pos].isalnum():
+        while pos < len(text) and text[pos].isalnum():
+            pos += 1
+    return pos
+
+
+def insert_citation_markers(text: str, markers: List[Tuple[int, List[int]]]) -> str:
+    """Insert ``[n]`` citation runs at the (safe) positions of ``markers``."""
+    if not markers:
+        return text
+    groups: Dict[int, set] = {}
+    for pos, numbers in markers:
+        if not numbers:
+            continue
+        point = safe_insertion_point(text, pos)
+        groups.setdefault(point, set()).update(numbers)
+    for point in sorted(groups, reverse=True):
+        run = "".join(f"[{n}]" for n in sorted(groups[point]))
+        if text[point : point + len(run)] == run:
+            continue
+        text = text[:point] + run + text[point:]
+    return text
+
+
+def _normalize_url(url: str) -> str:
+    """Citation key of a URL: lower-cased scheme and host, trailing / stripped."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    rest = ""
+    if parsed.query:
+        rest += "?" + parsed.query
+    if parsed.fragment:
+        rest += "#" + parsed.fragment
+    return f"{(parsed.scheme or '').lower()}://{(parsed.netloc or '').lower()}{path}{rest}"
+
+
+class CitationRegistry:
+    """Maps citation keys to stable numbers across the API calls of one turn."""
+
+    def __init__(self, offset: int = 0):
+        self.offset = offset
+        self.sources: Dict[int, dict] = {}
+        self._by_key: Dict[str, int] = {}
+
+    def number_for(self, key: str, info: dict) -> Tuple[int, bool]:
+        """The number for ``key`` and whether it was assigned just now."""
+        if key in self._by_key:
+            return self._by_key[key], False
+        number = len(self.sources) + self.offset + 1
+        self._by_key[key] = number
+        self.sources[number] = dict(info)
+        return number, True
+
+
+def _chunk_citation(chunk: dict, resolved: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    uri = chunk.get("uri")
+    url = resolved.get(uri, uri) if uri else None
+    if chunk.get("place_id"):
+        return "place:" + str(chunk["place_id"]), url
+    return _normalize_url(url) if url else None, url
+
+
+def cite_call_text(
+    text: str,
+    acc: GroundingAccumulator,
+    registry: CitationRegistry,
+    resolved: Dict[str, str],
+) -> Tuple[str, List[int], Dict[int, List[str]]]:
+    """Cite one API call's answer text with the turn's shared registry.
+
+    Returns the text with markers, the numbers that were new in this call
+    (ascending) and ``{number: [supporting segment texts]}``.
+    """
+    data = text.encode("utf-8")
+    markers: List[Tuple[int, List[int]]] = []
+    new_numbers = set()
+    references: Dict[int, List[str]] = {}
+    for support in acc.supports:
+        end = locate_support_end(data, support)
+        if end is None:
+            continue
+        point = safe_insertion_point(text, end)
+        numbers = []
+        for index in support["indices"]:
+            if not 0 <= index < len(acc.chunks):
+                continue
+            chunk = acc.chunks[index]
+            key, url = _chunk_citation(chunk, resolved)
+            if key is None:
+                continue
+            number, is_new = registry.number_for(
+                key,
+                {"title": chunk.get("title"), "url": url, "kind": chunk.get("kind")},
+            )
+            numbers.append(number)
+            if is_new:
+                new_numbers.add(number)
+            bucket = references.setdefault(number, [])
+            if support["text"] and support["text"] not in bucket:
+                bucket.append(support["text"])
+        if numbers:
+            markers.append((point, numbers))
+    for chunk in acc.chunks:
+        key, url = _chunk_citation(chunk, resolved)
+        if key is None:
+            continue
+        registry.number_for(
+            key, {"title": chunk.get("title"), "url": url, "kind": chunk.get("kind")}
+        )
+    return insert_citation_markers(text, markers), sorted(new_numbers), references
+
+
+_PATTERNS_SUGGESTION_CHIP = re.compile(
+    r"<a\b([^>]*)>(.*?)</a>", flags=re.S | re.I
+)
+_PATTERNS_CHIP_CLASS = re.compile(r'class\s*=\s*["\']([^"\']*)["\']', flags=re.I)
+_PATTERNS_CHIP_HREF = re.compile(r'href\s*=\s*["\']([^"\']*)["\']', flags=re.I)
+
+
+def extract_suggestion_links(html_text: str, queries: List[str]) -> List[Tuple[str, str]]:
+    """(label, href) pairs from the Search Suggestions chips of the entry point.
+
+    Falls back to Google search URLs built from the queries when the entry
+    point carries no chips (or no HTML at all).
+    """
+    links: List[Tuple[str, str]] = []
+    for match in _PATTERNS_SUGGESTION_CHIP.finditer(html_text or ""):
+        attrs, label = match.group(1), match.group(2)
+        class_match = _PATTERNS_CHIP_CLASS.search(attrs)
+        if not class_match or "chip" not in class_match.group(1).split():
+            continue
+        href_match = _PATTERNS_CHIP_HREF.search(attrs)
+        if not href_match:
+            continue
+        clean = re.sub(r"<[^>]+>", "", label).strip()
+        links.append((html.unescape(clean), html.unescape(href_match.group(1))))
+    if links:
+        return links
+    return [
+        (query, "https://www.google.com/search?q=" + quote_plus(query))
+        for query in (queries or [])
+    ]
+
+
+def prepare_entry_point_embed(html_text: str) -> str:
+    """Make the suggestion embed open links in a new tab, not the chat."""
+    if not html_text:
+        return ""
+    index = html_text.find("<head>")
+    if index != -1:
+        at = index + len("<head>")
+        return html_text[:at] + '<base target="_blank">' + html_text[at:]
+    return '<base target="_blank">' + html_text
+
+
+def _rag_citation_offset(sources: List[dict]) -> int:
+    """How many RAG source ids OpenWebUI already cited, so pipe numbers follow.
+
+    Counts unique ids exactly the way ``get_source_context`` in
+    open_webui/utils/middleware.py does: ``meta.get("source") or
+    source["source"]["id"]`` over ``zip(document, metadata)``.
+    """
+    seen = set()
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        for _doc, meta in zip(source.get("document") or [], source.get("metadata") or []):
+            meta = meta if isinstance(meta, dict) else {}
+            source_id = meta.get("source") or (source.get("source") or {}).get("id") or "N/A"
+            seen.add(str(source_id))
+    return len(seen)
+# END GENERATED SECTION: gemini_pipe.response.grounding
+
+# BEGIN GENERATED SECTION: gemini_pipe.response.state
+@dataclass
+class Segment:
+    """One rendered piece of the message: streamed text or a <details> block."""
+
+    kind: str
+    key: str
+    call: int
+    content: str
+
+
+@dataclass
+class RenderedMessage:
+    """The message as it will be persisted, in segment order.
+
+    Text segments stream; blocks (the <details> collapsibles) are upserted as a
+    whole. ``render()`` is the single source of truth for the message content,
+    and ``append_text`` returns exactly the string by which ``render()`` grew,
+    so ``message`` delta events stay consistent with it.
+    """
+
+    segments: List[Segment] = field(default_factory=list)
+
+    def _index_of(self, key: str) -> int:
+        for i, seg in enumerate(self.segments):
+            if seg.key == key:
+                return i
+        return -1
+
+    def render(self) -> str:
+        parts: List[str] = []
+        for i, seg in enumerate(self.segments):
+            if seg.kind == "block":
+                if parts and not parts[-1].endswith("\n"):
+                    parts.append("\n")
+                parts.append(seg.content)
+                if not seg.content.endswith("\n") and i + 1 < len(self.segments):
+                    parts.append("\n")
+            else:
+                parts.append(seg.content)
+        return "".join(parts)
+
+    def append_text(self, call: int, s: str) -> str:
+        if not s:
+            return ""
+        before = self.render()
+        if self.segments and self.segments[-1].kind == "text" and self.segments[-1].call == call:
+            self.segments[-1].content += s
+        else:
+            n = sum(1 for seg in self.segments if seg.kind == "text" and seg.call == call)
+            self.segments.append(Segment("text", f"text:{call}:{n}", call, s))
+        after = self.render()
+        if after.startswith(before):
+            return after[len(before):]
+        return after
+
+    def upsert_block(self, key: str, content: str, call: int, before_key: Optional[str] = None) -> None:
+        index = self._index_of(key)
+        if index != -1:
+            self.segments[index] = Segment("block", key, call, content)
+            return
+        seg = Segment("block", key, call, content)
+        if before_key is not None:
+            before = self._index_of(before_key)
+            if before != -1:
+                self.segments.insert(before, seg)
+                return
+        self.segments.append(seg)
+
+    def remove(self, key: str) -> None:
+        index = self._index_of(key)
+        if index != -1:
+            del self.segments[index]
+
+    def text_segments(self, call: int) -> List[Segment]:
+        return [seg for seg in self.segments if seg.kind == "text" and seg.call == call]
+
+    def checkpoint(self) -> List[Segment]:
+        return copy.deepcopy(self.segments)
+
+    def rollback(self, checkpoint: List[Segment]) -> None:
+        self.segments = copy.deepcopy(checkpoint)
+
+
+@dataclass
+class CallState:
+    """Everything one API call (one pass of the generation loop) contributes."""
+
+    index: int
+    raw_parts: List[Any] = field(default_factory=list)
+    function_calls: List[dict] = field(default_factory=list)
+    grounding: GroundingAccumulator = field(default_factory=GroundingAccumulator)
+    url_meta: List[dict] = field(default_factory=list)
+    finish_reason: Optional[str] = None
+    finish_message: Optional[str] = None
+    usage: Dict[str, Any] = field(default_factory=dict)
+    thought_key: Optional[str] = None
+    thought_text: str = ""
+    thought_started: float = 0.0
+    thought_runs: int = 0
+    last_thought_render: float = 0.0
+    image_tasks: List[Any] = field(default_factory=list)
+
+
+@dataclass
+class TurnState:
+    """The whole turn: every call plus the aggregates shared across calls."""
+
+    calls: List[CallState] = field(default_factory=list)
+    citations: CitationRegistry = field(default_factory=CitationRegistry)
+    usage_total: Dict[str, Any] = field(default_factory=dict)
+    search_queries: List[str] = field(default_factory=list)
+    tool_calls_made: int = 0
+    degraded: set = field(default_factory=set)
+    name_map: Dict[str, str] = field(default_factory=dict)
+# END GENERATED SECTION: gemini_pipe.response.state
+
+@dataclass
+class PipeRequestContext:
+    """Everything one ``pipe()`` call shares with its handlers.
+
+    Built fresh per request: the Pipe object itself is shared across all users
+    and concurrent requests, so nothing request-scoped may live on it.
+    """
+
+    pipe: "Pipe"
+    event_emitter: Optional[Callable[[dict], Awaitable[None]]]
+    msg: RenderedMessage
+    turn: TurnState
+    run_id: str
+    status: "StatusEmitter"
+    user: dict
+    user_valves: "Pipe.UserValves"
+    metadata: dict
+    request: dict
+    model: str
+    info: dict
+    api_key: str
+    tools: dict
+    builtin_tools: dict
+    rag_offset: int
+
+    async def emit_event(self, event: dict) -> None:
+        """Forward one OpenWebUI event, surviving a broken emitter."""
+        if self.event_emitter is None:
+            return
+        try:
+            await self.event_emitter(event)
+        except Exception as e:
+            logger.warning(f"event emitter failed: {e}")
+
+    async def emit_text(self, call: int, s: str) -> None:
+        d = self.msg.append_text(call, s)
+        await self.emit_event({"type": "message", "data": {"content": d}})
+
+    async def upsert_block(
+        self, key: str, content: str, call: int, before_key: Optional[str] = None
+    ) -> None:
+        self.msg.upsert_block(key, content, call, before_key=before_key)
+        await self.emit_event({"type": "replace", "data": {"content": self.msg.render()}})
+
+    async def emit_replace(self) -> None:
+        await self.emit_event({"type": "replace", "data": {"content": self.msg.render()}})
+
+    def text(self) -> str:
+        return self.msg.render()
+
+
+# BEGIN GENERATED SECTION: gemini_pipe.response.status_events
+class StatusEmitter:
+    def __init__(self, emit_event: Callable[[dict], Awaitable[None]]):
+        """Wrap an OpenWebUI ``emit_event`` callback with dedup state for status events."""
+        self._emit_event = emit_event
+        self._last_payload: dict | None = None
+
+    async def emit(
+        self,
+        description: str,
+        *,
+        done: bool = False,
+        hidden: bool | None = None,
+        force: bool = False,
+        **fields: Any,
+    ) -> None:
+        """Emit an OpenWebUI ``status`` event, skipping an identical repeat.
+
+        Dedup is what keeps the phase model cheap: a phase family can announce
+        itself on every block without stuttering the history when several blocks
+        of the same kind arrive in a row (grounded answers split prose into many
+        text blocks around their citation markers).
+        """
+        data: dict = {"description": description, "done": done}
+        if hidden is not None:
+            data["hidden"] = hidden
+        data.update(fields)
+
+        if not force and data == self._last_payload:
+            return
+
+        await self._emit_event({"type": "status", "data": data})
+        self._last_payload = data
+
+    # -- phases ------------------------------------------------------------
+    # One method per thing that can actually be happening, so call sites read as
+    # intent and the wording stays consistent across handlers.
+
+    async def waiting(self) -> None:
+        """Before the first byte: the request is out, nothing has come back yet."""
+        await self.emit("Waiting for response...", hidden=False, force=True)
+
+    async def thinking(self) -> None:
+        """A thought is streaming."""
+        await self.emit("💭 Thinking...")
+
+    async def responding(self) -> None:
+        """Text is streaming — the model is writing the answer.
+
+        Emitted on every text run, not once per turn: after a tool runs, text
+        resuming is a real phase change the user should see.
+        """
+        await self.emit("Responding...")
+
+    async def searching_google(self, queries: list) -> None:
+        """Google Search grounding is running for the model."""
+        shown = " · ".join(queries[:3]) if queries else ""
+        await self.emit(f"🔍 Searching Google: {shown}" if shown else "🔍 Searching Google...")
+
+    async def web_search_done(self, urls: list, queries: list = None) -> None:
+        """Report finished search results using OpenWebUI's native renderer.
+
+        With ``action="web_search"`` and ``urls`` the frontend renders a
+        clickable source list rather than a plain text line.
+        """
+        if not urls:
+            return
+        await self.emit(
+            "Searched {{count}} sites",
+            action="web_search",
+            urls=list(urls),
+            queries=list(queries or []),
+            count=len(urls),
+        )
+
+    async def read_urls(self, urls: list, failed: int = 0) -> None:
+        """URL context finished reading the pages from the conversation."""
+        if not urls and not failed:
+            return
+        description = "Read {{count}} pages" + (f", {failed} failed" if failed else "")
+        await self.emit(
+            description,
+            action="web_search",
+            urls=list(urls or []),
+            count=len(urls or []),
+        )
+
+    async def places_found(self, urls: list) -> None:
+        """Google Maps grounding returned places."""
+        if not urls:
+            return
+        await self.emit(
+            "Found {{count}} places",
+            action="web_search",
+            urls=list(urls),
+            count=len(urls),
+        )
+
+    async def fetching_url(self, url: str = "") -> None:
+        """A URL from the conversation is being fetched for the model."""
+        await self.emit(f"🌐 Fetching {url}" if url else "🌐 Fetching URL...")
+
+    async def running_tool(self, tool_name: str) -> None:
+        """An OpenWebUI-side tool call is being dispatched."""
+        await self.emit(f"🔧 Running {tool_name}..." if tool_name else "🔧 Running tool...")
+
+    async def activity(self, description: str) -> None:
+        """Free-form in-progress phase, for one-off states without a named phase."""
+        await self.emit(description, done=False)
+
+    async def complete(self, description: str) -> None:
+        """Close the status line for this turn. Only the final status is ``done``."""
+        await self.emit(description, done=True, force=True)
+
+    async def notification(self, content: str, *, type: str = "warning") -> None:
+        """Emit an OpenWebUI ``notification`` event (e.g. warning/error toast)."""
+        await self._emit_event(
+            {"type": "notification", "data": {"type": type, "content": content}}
+        )
+# END GENERATED SECTION: gemini_pipe.response.status_events
 
 class Pipe:
     """OpenWebUI manifold pipe for the Gemini Developer API."""
@@ -906,5 +1556,526 @@ class Pipe:
     async def pipes(self) -> List[dict]:
         """OpenWebUI entry point returning the list of available Gemini models."""
         return await self.get_gemini_models()
+
+    _PATTERN_URL = re.compile(r"https?://[^\s<>\"')\]]+")
+
+    @staticmethod
+    def _parse_lat_lng(*parts) -> Optional[Tuple[float, float]]:
+        """(lat, lng) from a (lat, lng) pair or a "lat, lng" string; None when
+        missing or unparsable, so callers fall through to the next source."""
+        if len(parts) == 2:
+            pairs = [(str(parts[0]), str(parts[1]))]
+        elif len(parts) == 1:
+            pieces = [p.strip() for p in str(parts[0] or "").split(",")]
+            pairs = [(pieces[0], pieces[1])] if len(pieces) == 2 else []
+        else:
+            pairs = []
+        for lat, lng in pairs:
+            try:
+                return (float(lat), float(lng))
+            except ValueError:
+                continue
+        return None
+
+    def _last_user_url(self, text: str) -> Optional[str]:
+        """The first non-YouTube URL in the user's last message, if any."""
+        for match in self._PATTERN_URL.finditer(text or ""):
+            host = urlparse(match.group(0)).netloc.lower()
+            if host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be"):
+                continue
+            return match.group(0)
+        return None
+
+    def _resolve_builtin_flags(
+        self, metadata: dict, valves, user_valves, info: dict, last_user_text: str
+    ) -> dict:
+        """Which built-in tools are on for this request, plus the Maps location."""
+        metadata = metadata or {}
+        search = bool(
+            (
+                valves.WEB_SEARCH_DEFAULT
+                or metadata.get("gemini_web_search")
+                or metadata.get("web_search_enforced")
+            )
+            and info.get("search")
+        )
+
+        mode = valves.URL_CONTEXT or "auto"
+        url_context_auto = False
+        if mode == "off":
+            url_context = False
+        elif mode == "always":
+            url_context = True
+        elif mode == "with_search":
+            url_context = search
+        else:
+            url = self._last_user_url(last_user_text)
+            url_context = bool(search or url)
+            url_context_auto = bool(url and not search)
+        url_context = url_context and bool(info.get("url_context"))
+
+        maps = bool(
+            (valves.MAPS_DEFAULT or metadata.get("gemini_maps")) and info.get("maps")
+        )
+
+        lat_lng = None
+        if user_valves is not None:
+            lat_lng = self._parse_lat_lng(
+                user_valves.MAPS_LATITUDE, user_valves.MAPS_LONGITUDE
+            )
+        if lat_lng is None:
+            raw = (metadata.get("variables") or {}).get("{{USER_LOCATION}}")
+            if raw:
+                lat_lng = self._parse_lat_lng(raw)
+        if lat_lng is None:
+            lat_lng = self._parse_lat_lng(valves.MAPS_LATITUDE, valves.MAPS_LONGITUDE)
+
+        return {
+            "search": search,
+            "url_context": url_context,
+            "url_context_auto": url_context_auto,
+            "maps": maps,
+            "lat_lng": lat_lng,
+        }
+
+    def _assemble_tools(
+        self, info: dict, flags: dict, decls: List
+    ) -> Tuple[List, Optional[object], List[str]]:
+        """The Tool list for one call, its ToolConfig, and the degradation notes."""
+        model = info.get("name") or "this model"
+        notes: List[str] = []
+        decls = list(decls or [])
+
+        search = bool(flags.get("search"))
+        maps = bool(flags.get("maps"))
+        url_context = bool(flags.get("url_context"))
+        url_context_auto = bool(flags.get("url_context_auto"))
+        lat_lng = flags.get("lat_lng")
+
+        if decls and not info.get("functions", True):
+            notes.append(
+                f"Function tools disabled for this message: {model} does not support function calling"
+            )
+            decls = []
+
+        if search and maps and not info.get("maps_with_search"):
+            search = False
+            notes.append(
+                f"Google Search disabled for this message: {model} cannot combine it with Google Maps"
+            )
+
+        builtins = search or url_context or maps
+        if decls and builtins and not info.get("builtin_with_functions"):
+            # The URL context that a URL in the user's message pulled in is the
+            # softest dependency, so it goes first and silently.
+            if url_context_auto:
+                url_context = False
+                builtins = search or maps
+            if builtins:
+                if self.valves.BUILTIN_TOOL_CONFLICT == "prefer_functions":
+                    search = url_context = maps = False
+                    builtins = False
+                    notes.append(
+                        f"Google Search/Maps disabled for this message: {model} cannot combine them with function tools"
+                    )
+                else:
+                    decls = []
+                    notes.append(
+                        f"Function tools disabled for this message: {model} cannot combine them with Google Search/Maps"
+                    )
+
+        tools: List = []
+        if decls:
+            tools.append(gtypes.Tool(function_declarations=decls))
+        if search:
+            tools.append(gtypes.Tool(google_search=gtypes.GoogleSearch()))
+        if url_context:
+            tools.append(gtypes.Tool(url_context=gtypes.UrlContext()))
+        if maps:
+            tools.append(gtypes.Tool(google_maps=gtypes.GoogleMaps()))
+
+        retrieval = None
+        if maps and lat_lng:
+            retrieval = gtypes.RetrievalConfig(
+                lat_lng=gtypes.LatLng(latitude=lat_lng[0], longitude=lat_lng[1])
+            )
+
+        tool_config = None
+        if decls and builtins:
+            # Both sides stay: the SDK executes the built-ins server-side and
+            # reports them back as regular tool calls.
+            kwargs: dict = {}
+            if GENAI_HAS_SERVER_SIDE_INVOCATIONS:
+                kwargs["include_server_side_tool_invocations"] = True
+            kwargs["function_calling_config"] = gtypes.FunctionCallingConfig(
+                mode="VALIDATED"
+            )
+            if retrieval:
+                kwargs["retrieval_config"] = retrieval
+            tool_config = gtypes.ToolConfig(**kwargs)
+        elif builtins and retrieval:
+            tool_config = gtypes.ToolConfig(retrieval_config=retrieval)
+
+        return tools, tool_config, notes
+
+    _LEVEL_ORDER = ("minimal", "low", "medium", "high")
+    _EFFORT_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
+
+    @classmethod
+    def _clamp_level(cls, allowed: List[str], effort: str) -> str:
+        """The allowed thinking level closest to ``effort``; ties go up."""
+        allowed = [level for level in (allowed or []) if level in cls._LEVEL_ORDER]
+        if not allowed:
+            return "low"
+        rank = {name: i for i, name in enumerate(cls._LEVEL_ORDER)}
+        e = str(effort or "auto").lower()
+        if e in ("none", "minimal"):
+            target = 0
+        elif e in ("xhigh", "max", "ultra"):
+            target = len(cls._LEVEL_ORDER)
+        elif e in rank:
+            target = rank[e]
+        else:
+            return max(allowed, key=lambda level: rank[level])
+        return min(allowed, key=lambda level: (abs(rank[level] - target), -rank[level]))
+
+    def _build_thinking_config(
+        self, info: dict, user_valves, body: dict, purpose: str = "chat"
+    ):
+        """The ThinkingConfig for this call, or None when the model has no
+        thinking. A config never sets both a level and a budget."""
+        if info.get("thinking") == "none":
+            return None
+        body = body or {}
+        show = bool(user_valves.SHOW_THOUGHTS) if user_valves is not None else True
+        effort = body.get("reasoning_effort") or (
+            user_valves.THINKING_LEVEL if user_valves is not None else "auto"
+        )
+        valve_budget = (
+            user_valves.THINKING_BUDGET if user_valves is not None else -1
+        )
+        task = purpose == "task"
+        mode = info.get("thinking")
+
+        if mode == "always":
+            return gtypes.ThinkingConfig(include_thoughts=show)
+
+        if mode == "level":
+            if task:
+                level = self._clamp_level(info.get("thinking_levels"), "minimal")
+                return gtypes.ThinkingConfig(
+                    thinking_level=gtypes.ThinkingLevel[level.upper()],
+                    include_thoughts=False,
+                )
+            if not effort or effort == "auto":
+                return gtypes.ThinkingConfig(include_thoughts=show)
+            level = self._clamp_level(info.get("thinking_levels"), effort)
+            return gtypes.ThinkingConfig(
+                thinking_level=gtypes.ThinkingLevel[level.upper()],
+                include_thoughts=show,
+            )
+
+        # mode == "budget" (Gemini 2.5)
+        lo, hi = (info.get("budget_range") or (0, 0))
+        can_disable = bool(info.get("thinking_can_disable"))
+        if task:
+            budget = 0 if can_disable else lo
+            return gtypes.ThinkingConfig(thinking_budget=budget, include_thoughts=False)
+        e = str(effort or "").lower()
+        if e in self._EFFORT_BUDGETS:
+            budget = self._EFFORT_BUDGETS[e]
+        elif e in ("none", "minimal"):
+            budget = 0 if can_disable else lo
+        else:
+            budget = valve_budget
+            if budget != -1:
+                budget = max(lo, min(hi, budget))
+        return gtypes.ThinkingConfig(thinking_budget=budget, include_thoughts=show)
+
+    def _build_generate_config(
+        self,
+        *,
+        info: dict,
+        system_instruction,
+        tools,
+        tool_config,
+        thinking,
+        body: dict,
+        user_valves,
+        purpose: str = "chat",
+    ):
+        """The GenerateContentConfig for one call (image models extend this in
+        the image-generation milestone)."""
+        kwargs: dict = {
+            "automatic_function_calling": gtypes.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+        }
+        if system_instruction is not None:
+            kwargs["system_instruction"] = system_instruction
+        if tools:
+            kwargs["tools"] = tools
+        if tool_config is not None:
+            kwargs["tool_config"] = tool_config
+        if thinking is not None:
+            kwargs["thinking_config"] = thinking
+
+        body = body or {}
+        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
+        if max_tokens:
+            max_output = info.get("max_output")
+            try:
+                kwargs["max_output_tokens"] = (
+                    min(int(max_tokens), max_output) if max_output else int(max_tokens)
+                )
+            except (TypeError, ValueError):
+                pass
+
+        stop = body.get("stop")
+        if stop:
+            kwargs["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
+
+        resolution = (
+            user_valves.MEDIA_RESOLUTION if user_valves is not None else "auto"
+        ) or "auto"
+        if resolution in ("low", "medium", "high"):
+            kwargs["media_resolution"] = gtypes.MediaResolution[
+                "MEDIA_RESOLUTION_" + resolution.upper()
+            ]
+
+        if GENAI_HAS_STORE:
+            kwargs["store"] = bool(self.valves.STORE_REQUESTS)
+
+        response_format = body.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+            kwargs["response_mime_type"] = "application/json"
+            schema = (response_format.get("json_schema") or {}).get("schema")
+            if schema:
+                kwargs["response_json_schema"] = schema
+
+        return gtypes.GenerateContentConfig(**kwargs)
+
+    @staticmethod
+    def _block_visibility_key(name: str) -> str:
+        """Map a block name onto its visibility key.
+
+        A single logical block reaches the formatters under several names, but
+        the user hides *one* concept. Normalising here keeps the HIDE_BLOCKS
+        valve spelled in concepts rather than wire names.
+        """
+        return name
+
+    def _is_block_hidden(self, name: str) -> bool:
+        """True when this block concept is not to be rendered for this request.
+
+        Sub-agent runs (SLIM_OUTPUT) render no decoration at all; otherwise the
+        request-scoped HIDDEN_BLOCKS ContextVar decides.
+        """
+        if SLIM_OUTPUT.get():
+            return True
+        hidden = HIDDEN_BLOCKS.get()
+        if not hidden:
+            return False
+        return self._block_visibility_key(name) in hidden
+
+    @staticmethod
+    def _parse_hidden_blocks(raw: Any) -> frozenset:
+        """Normalize the HIDE_BLOCKS valve into a set of block concept keys.
+
+        The valve is a multiselect (``list[str]``); values saved under the
+        previous comma-separated ``str`` form are still accepted so an upgrade
+        does not silently drop a user's preference.
+        """
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        if not raw:
+            return frozenset()
+        return frozenset(str(part).strip() for part in raw if str(part).strip())
+
+    @staticmethod
+    def _append_block_to_text(text: str, block: str) -> str:
+        """Append a rendered block with a safe markdown/html separator."""
+        if not text:
+            return block
+        if not block:
+            return text
+        if text.endswith(("\n", "\r")) or block.startswith(("\n", "\r")):
+            return text + block
+        return f"{text}\n{block}"
+
+    def _format_thinking_block(
+        self, content: str, done: bool = False, duration: Optional[float] = None
+    ) -> str:
+        """Format a thought with OpenWebUI native <details type="reasoning">.
+
+        ``done`` closes the block (spinner off, "Thought for N seconds"); while
+        streaming the block stays open under "Thinking…".
+        """
+        if self._is_block_hidden("reasoning"):
+            return ""
+
+        # Escape content and add > prefix per line (OpenWebUI quote block style)
+        escaped_lines = "\n".join(
+            f"> {html.escape(line)}" if not line.startswith(">") else html.escape(line)
+            for line in content.splitlines()
+        )
+
+        if done:
+            duration_int = int(duration or 0)
+            duration_attr = f' duration="{duration_int}"' if duration is not None else ""
+            return (
+                f'<details type="reasoning" done="true"{duration_attr}>\n'
+                f"<summary>Thought for {duration_int} seconds</summary>\n"
+                f"{escaped_lines}\n"
+                f"</details>\n"
+            )
+        return (
+            '<details type="reasoning" done="false">\n'
+            "<summary>Thinking…</summary>\n"
+            f"{escaped_lines}\n"
+            "</details>\n"
+        )
+
+    def _format_tool_result_block(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        tool_input: dict,
+        tool_output: str,
+        is_error: bool = False,
+        done: bool = True,
+        embeds: list = None,
+        files: list = None,
+    ) -> str:
+        """Format a tool result block with OpenWebUI native <details type="tool_calls">.
+
+        ``done`` False shows "Executing..." with spinner; True, "Tool Executed".
+        ``embeds``/``files`` carry the process_tool_result output (HTML strings,
+        file chips) into the block.
+        """
+        if SLIM_OUTPUT.get():
+            # The tool ran; only its effect on the answer matters to the parent
+            # agent. Arguments, raw result, embeds and file chips are markup a
+            # human would expand -- nobody will.
+            return ""
+
+        # Escape arguments for HTML attribute
+        escaped_args = (
+            html.escape(json.dumps(tool_input, ensure_ascii=False)) if tool_input else ""
+        )
+
+        done_str = "true" if done else "false"
+        summary = "Tool Executed" if done else "Executing..."
+        error_attr = ' error="true"' if is_error and done else ""
+
+        if done:
+            # Escape result for HTML attribute
+            try:
+                if isinstance(tool_output, str):
+                    try:
+                        parsed = json.loads(tool_output)
+                        escaped_result = html.escape(json.dumps(parsed, ensure_ascii=False))
+                    except (json.JSONDecodeError, ValueError):
+                        escaped_result = html.escape(json.dumps(tool_output, ensure_ascii=False))
+                else:
+                    escaped_result = html.escape(json.dumps(tool_output, ensure_ascii=False))
+            except Exception:
+                escaped_result = html.escape(json.dumps(str(tool_output), ensure_ascii=False))
+
+            escaped_embeds = (
+                html.escape(json.dumps(embeds, ensure_ascii=False)) if embeds else ""
+            )
+
+            return (
+                f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'arguments="{escaped_args}" result="{escaped_result}" '
+                f'files="{html.escape(json.dumps(files)) if files else ""}" '
+                f'embeds="{escaped_embeds}"{error_attr}>\n'
+                f"<summary>{summary}</summary>\n"
+                f"</details>\n"
+            )
+        return (
+            f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+            f'arguments="{escaped_args}">\n'
+            f"<summary>{summary}</summary>\n"
+            f"</details>\n"
+        )
+
+    def _format_google_search_block(
+        self,
+        call: int,
+        queries: List[str],
+        sources: List[Tuple[int, str, str]],
+        embed_html: str = "",
+    ) -> str:
+        """The Google Search block: the queries asked, the sources found, and
+        the Search Suggestions embed Google's terms require us to show."""
+        if self._is_block_hidden("google_search"):
+            return ""
+
+        escaped_args = html.escape(json.dumps({"queries": list(queries or [])}, ensure_ascii=False))
+        escaped_result = html.escape(
+            json.dumps(
+                [{"n": n, "title": title, "url": url} for n, title, url in (sources or [])],
+                ensure_ascii=False,
+            )
+        )
+        escaped_embeds = (
+            html.escape(json.dumps([embed_html], ensure_ascii=False)) if embed_html else ""
+        )
+
+        shown = [q for q in (queries or []) if q][:3]
+        summary = "Searched Google: " + " · ".join(shown) if shown else "Searched Google"
+        if len([q for q in (queries or []) if q]) > 3:
+            summary += f" +{len([q for q in queries if q]) - 3} more"
+
+        body = ""
+        if sources:
+            body = "\n" + "\n".join(f"- [{n}] [{title}]({url})" for n, title, url in sources) + "\n"
+
+        return (
+            f'<details type="tool_calls" done="true" id="gsearch_{call}" name="google_search" '
+            f'data-gemini-builtin="1" arguments="{escaped_args}" result="{escaped_result}" '
+            f'embeds="{escaped_embeds}">\n'
+            f"<summary>{summary}</summary>\n"
+            f"{body}</details>\n"
+        )
+
+    def _format_url_context_block(self, call: int, entries: List[dict]) -> str:
+        """The URL context block: one line per URL from the conversation,
+        marked ✅ when the model could read it, ❌ otherwise."""
+        if self._is_block_hidden("url_context"):
+            return ""
+
+        lines = []
+        for entry in entries or []:
+            url = entry.get("url") or ""
+            status = str(entry.get("status") or "")
+            if status.lower() == "ok":
+                lines.append(f"- ✅ [{url}]({url})")
+            else:
+                lines.append(f"- ❌ {url}" + (f" ({status})" if status else ""))
+        body = ("\n" + "\n".join(lines) + "\n") if lines else ""
+
+        return (
+            f'<details type="tool_calls" done="true" id="urlctx_{call}" name="url_context" '
+            f'data-gemini-builtin="1">\n'
+            f"<summary>Read {len(entries or [])} pages</summary>\n"
+            f"{body}</details>\n"
+        )
+
+    def _format_suggestion_links_line(self, links: List[Tuple[str, str]]) -> str:
+        """The plain-text fallback for Search Suggestions (valve "links")."""
+        if not links:
+            return ""
+        return (
+            "🔎 **Google Search suggestions:** "
+            + " · ".join(f"[{label}]({href})" for label, href in links)
+            + "\n"
+        )
+
+    def _format_notice(self, text: str) -> str:
+        """A short warning line appended to the answer (degraded capability, …)."""
+        return "\n> ⚠️ " + text + "\n"
 
     # END GENERATED SECTION: gemini_pipe.pipe_method_groups

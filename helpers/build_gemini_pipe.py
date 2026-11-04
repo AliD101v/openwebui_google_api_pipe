@@ -29,10 +29,17 @@ MIN_FILE = PIPE_DIR / "gemini_pipe.min.py"
 SRC_DIR = PIPE_DIR / "src" / "gemini_pipe"
 TEMPLATE_SOURCE = SRC_DIR / "pipe_template.py"
 
-STREAM_SOURCES: list[tuple[str, str]] = []
+STREAM_SOURCES: list[tuple[str, str]] = [
+    ("response.grounding", "response/grounding.py"),
+    ("response.state", "response/state.py"),
+    ("response.status_events", "response/status_events.py"),
+]
 
 METHOD_GROUP_SOURCES: list[str] = [
     "shared/models.py",
+    "request/tools.py",
+    "request/config.py",
+    "response/formatting.py",
 ]
 
 METHOD_GROUP_INSERT_MARKER = "    # COMPILED PIPE METHOD GROUPS INSERTION POINT"

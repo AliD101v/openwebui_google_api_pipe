@@ -26,6 +26,7 @@ v0.1.0
 import asyncio
 import base64
 import contextvars
+import copy
 import hashlib
 import html
 import inspect
@@ -380,6 +381,72 @@ try:
 except ImportError:
     get_image_base64_from_url = None
     IMAGE_URL_FETCH_AVAILABLE = False
+
+
+# =============================================================================
+# STREAM STATE (GENERATED SECTIONS) AND REQUEST CONTEXT
+# =============================================================================
+
+# BEGIN GENERATED SECTION: gemini_pipe.response.grounding
+# END GENERATED SECTION: gemini_pipe.response.grounding
+
+# BEGIN GENERATED SECTION: gemini_pipe.response.state
+# END GENERATED SECTION: gemini_pipe.response.state
+
+
+@dataclass
+class PipeRequestContext:
+    """Everything one ``pipe()`` call shares with its handlers.
+
+    Built fresh per request: the Pipe object itself is shared across all users
+    and concurrent requests, so nothing request-scoped may live on it.
+    """
+
+    pipe: "Pipe"
+    event_emitter: Optional[Callable[[dict], Awaitable[None]]]
+    msg: RenderedMessage
+    turn: TurnState
+    run_id: str
+    status: "StatusEmitter"
+    user: dict
+    user_valves: "Pipe.UserValves"
+    metadata: dict
+    request: dict
+    model: str
+    info: dict
+    api_key: str
+    tools: dict
+    builtin_tools: dict
+    rag_offset: int
+
+    async def emit_event(self, event: dict) -> None:
+        """Forward one OpenWebUI event, surviving a broken emitter."""
+        if self.event_emitter is None:
+            return
+        try:
+            await self.event_emitter(event)
+        except Exception as e:
+            logger.warning(f"event emitter failed: {e}")
+
+    async def emit_text(self, call: int, s: str) -> None:
+        d = self.msg.append_text(call, s)
+        await self.emit_event({"type": "message", "data": {"content": d}})
+
+    async def upsert_block(
+        self, key: str, content: str, call: int, before_key: Optional[str] = None
+    ) -> None:
+        self.msg.upsert_block(key, content, call, before_key=before_key)
+        await self.emit_event({"type": "replace", "data": {"content": self.msg.render()}})
+
+    async def emit_replace(self) -> None:
+        await self.emit_event({"type": "replace", "data": {"content": self.msg.render()}})
+
+    def text(self) -> str:
+        return self.msg.render()
+
+
+# BEGIN GENERATED SECTION: gemini_pipe.response.status_events
+# END GENERATED SECTION: gemini_pipe.response.status_events
 
 
 class Pipe:
