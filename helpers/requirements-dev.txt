@@ -1,0 +1,6 @@
+google-genai>=1.68.0
+pydantic>=2.0.0
+cryptography
+httpx
+pillow
+pytest
