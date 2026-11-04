@@ -279,7 +279,7 @@ def cite_call_text(
         end = locate_support_end(data, support)
         if end is None:
             continue
-        point = safe_insertion_point(text, end)
+        point = safe_insertion_point(text, byte_to_char_index(text, end))
         numbers = []
         for index in support["indices"]:
             if not 0 <= index < len(acc.chunks):

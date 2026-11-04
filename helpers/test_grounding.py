@@ -203,3 +203,31 @@ def test_rag_citation_offset():
         },
     ]
     assert mod._rag_citation_offset(sources) == 2
+
+
+def test_cite_call_text_multibyte_offsets():
+    # regression: markers must use character positions, not UTF-8 byte offsets
+    mod = load_pipe_module()
+    text = "Berlin hat 3,7 Mio. Einwohner 🏙️. Die Spree fließt durch die Stadt.\n\n| a | b |\n"
+    s1 = "Berlin hat 3,7 Mio. Einwohner 🏙️."
+    s2 = "Die Spree fließt durch die Stadt."
+    e1 = len(s1.encode())
+    acc = mod.GroundingAccumulator()
+    acc.add(
+        {
+            "grounding_chunks": [
+                {"web": {"uri": "https://a.example/1", "title": "A"}},
+                {"web": {"uri": "https://b.example/2", "title": "B"}},
+            ],
+            "grounding_supports": [
+                {"segment": {"start_index": 0, "end_index": e1, "text": s1}, "grounding_chunk_indices": [0]},
+                {"segment": {"start_index": e1 + 1, "end_index": e1 + 1 + len(s2.encode()), "text": s2},
+                 "grounding_chunk_indices": [1]},
+            ],
+        }
+    )
+    out, new, _ = mod.cite_call_text(text, acc, mod.CitationRegistry(), {})
+    assert out == (
+        "Berlin hat 3,7 Mio. Einwohner 🏙️.[1] Die Spree fließt durch die Stadt.[2]\n\n| a | b |\n"
+    )
+    assert new == [1, 2]
