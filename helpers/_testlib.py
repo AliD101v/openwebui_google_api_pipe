@@ -58,19 +58,66 @@ def fake_model(name, display_name=None, supported_actions=("generateContent",),
     return gtypes.Model(**{k: v for k, v in kwargs.items() if v is not None})
 
 
+def pipe_module(pipe):
+    """The built module the ``pipe`` instance was created from."""
+    return sys.modules[type(pipe).__module__]
+
+
+def make_ctx(pipe, model="gemini-4-argon", emitter=None, metadata=None, user_valves=None):
+    """A PipeRequestContext for ``pipe`` via the built module's new_request_context."""
+    return pipe_module(pipe).new_request_context(
+        pipe,
+        model=model,
+        event_emitter=emitter,
+        metadata=metadata,
+        user_valves=user_valves,
+    )
+
+
+class FakeEmitter:
+    """An async event sink: each emitted event is appended to ``.events``."""
+
+    def __init__(self) -> None:
+        self.events = []
+
+    async def __call__(self, event: dict) -> None:
+        self.events.append(event)
+
+    def of_type(self, t: str) -> list:
+        return [e for e in self.events if e.get("type") == t]
+
+
+def chunk(d: dict):
+    """A GenerateContentResponse from a plain dict (the SDK accepts camelCase)."""
+    from google.genai import types as gtypes
+
+    return gtypes.GenerateContentResponse.model_validate(d)
+
+
 class FakeClient:
     """Stands in for google.genai.Client (wired by patching _build_genai_client).
 
     ``aio.models.list`` is awaitable and returns an async iterator. With no
     scripts it always iterates ``models``; otherwise each call pops the next
     script item, where an item that is an Exception is raised instead. Every
-    call is recorded in ``calls``.
+    list call is recorded in ``calls``.
+
+    ``aio.models.generate_content_stream(**kw)`` records ``kw`` in
+    ``stream_calls`` and returns an async iterator over the next script: each
+    script is a list whose items are chunks, or an Exception (raised when the
+    iterator reaches it). ``aio.models.generate_content(**kw)`` records ``kw``
+    in ``generate_calls`` and returns the next item of ``responses`` (a
+    GenerateContentResponse), or raises it when it is an Exception.
+    ``aio.aclose`` is a no-op.
     """
 
-    def __init__(self, models=None, scripts=None):
+    def __init__(self, models=None, scripts=None, responses=None):
         self.models = list(models or [])
         self.scripts = list(scripts or [])
+        self.responses = list(responses or [])
         self.calls = []
+        self.stream_calls = []
+        self.generate_calls = []
         self.aio = SimpleNamespace(
             models=self._AioModels(self), aclose=self._aclose
         )
@@ -93,7 +140,24 @@ class FakeClient:
                 raise item
             return self._iter(list(item))
 
+        async def generate_content_stream(self, **kwargs):
+            self._client.stream_calls.append(kwargs)
+            if not self._client.scripts:
+                raise AssertionError("no script left for generate_content_stream")
+            return self._iter(self._client.scripts.pop(0))
+
+        async def generate_content(self, **kwargs):
+            self._client.generate_calls.append(kwargs)
+            if not self._client.responses:
+                raise AssertionError("no response left for generate_content")
+            item = self._client.responses.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
         @staticmethod
         async def _iter(items):
             for item in items:
+                if isinstance(item, BaseException):
+                    raise item
                 yield item
