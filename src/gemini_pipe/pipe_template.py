@@ -42,7 +42,7 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote, quote_plus
 from pydantic import BaseModel, Field, field_validator
 
 # =============================================================================
@@ -443,6 +443,48 @@ class PipeRequestContext:
 
     def text(self) -> str:
         return self.msg.render()
+
+
+def new_request_context(
+    pipe,
+    *,
+    event_emitter=None,
+    model="",
+    info=None,
+    user=None,
+    user_valves=None,
+    metadata=None,
+    request=None,
+    api_key="",
+    tools=None,
+    builtin_tools=None,
+    rag_offset=0,
+) -> PipeRequestContext:
+    """The fresh context every pipe() call builds before anything else.
+
+    One Pipe instance serves all users and concurrent requests, so everything
+    request-scoped is created here, per call, and handed down as ``ctx``.
+    """
+    ctx = PipeRequestContext(
+        pipe=pipe,
+        event_emitter=event_emitter,
+        msg=RenderedMessage(),
+        turn=TurnState(citations=CitationRegistry(rag_offset)),
+        run_id=uuid.uuid4().hex[:8],
+        status=None,
+        user=dict(user or {}),
+        user_valves=pipe.UserValves() if user_valves is None else user_valves,
+        metadata=dict(metadata or {}),
+        request=dict(request or {}),
+        model=model,
+        info=dict(info or {}),
+        api_key=api_key,
+        tools=dict(tools or {}),
+        builtin_tools=dict(builtin_tools or {}),
+        rag_offset=rag_offset,
+    )
+    ctx.status = StatusEmitter(ctx.emit_event)
+    return ctx
 
 
 # BEGIN GENERATED SECTION: gemini_pipe.response.status_events

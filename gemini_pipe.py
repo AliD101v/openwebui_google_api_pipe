@@ -42,7 +42,7 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote, quote_plus
 from pydantic import BaseModel, Field, field_validator
 
 # =============================================================================
@@ -911,6 +911,48 @@ class PipeRequestContext:
         return self.msg.render()
 
 
+def new_request_context(
+    pipe,
+    *,
+    event_emitter=None,
+    model="",
+    info=None,
+    user=None,
+    user_valves=None,
+    metadata=None,
+    request=None,
+    api_key="",
+    tools=None,
+    builtin_tools=None,
+    rag_offset=0,
+) -> PipeRequestContext:
+    """The fresh context every pipe() call builds before anything else.
+
+    One Pipe instance serves all users and concurrent requests, so everything
+    request-scoped is created here, per call, and handed down as ``ctx``.
+    """
+    ctx = PipeRequestContext(
+        pipe=pipe,
+        event_emitter=event_emitter,
+        msg=RenderedMessage(),
+        turn=TurnState(citations=CitationRegistry(rag_offset)),
+        run_id=uuid.uuid4().hex[:8],
+        status=None,
+        user=dict(user or {}),
+        user_valves=pipe.UserValves() if user_valves is None else user_valves,
+        metadata=dict(metadata or {}),
+        request=dict(request or {}),
+        model=model,
+        info=dict(info or {}),
+        api_key=api_key,
+        tools=dict(tools or {}),
+        builtin_tools=dict(builtin_tools or {}),
+        rag_offset=rag_offset,
+    )
+    ctx.status = StatusEmitter(ctx.emit_event)
+    return ctx
+
+
 # BEGIN GENERATED SECTION: gemini_pipe.response.status_events
 class StatusEmitter:
     def __init__(self, emit_event: Callable[[dict], Awaitable[None]]):
@@ -1236,326 +1278,399 @@ class Pipe:
 
     # COMPILED PIPE METHOD GROUPS INSERTION POINT
     # BEGIN GENERATED SECTION: gemini_pipe.pipe_method_groups
-    # Model names containing any of these are not chat models, whatever the
-    # API metadata says (embeddings, TTS, video, audio, agents, open models).
-    _CHAT_MODEL_REJECT_TOKENS = (
-        "embedding",
-        "aqa",
-        "tts",
-        "native-audio",
-        "live",
-        "lyria",
-        "veo",
-        "imagen",
-        "computer-use",
-        "robotics",
-        "deep-research",
-        "agent",
-        "learnlm",
-        "gemma",
-        "transcribe",
-        "omni",
-    )
+    _METADATA_MARKER = re.compile(PATTERN_METADATA_MARKER)
 
-    # Served when live discovery fails with no usable cache and the endpoint
-    # returned no models: the chat models a default install can expect.
-    _STATIC_FALLBACK_MODELS = (
-        "gemini-4-argon",
-        "gemini-3.8-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-nano-banana-2.1",
-    )
+    def _extract_and_remove_memories(self, text: str) -> tuple[str, Optional[str]]:
+        """Extract the OpenWebUI Memory System's memories out of the system
+        prompt and remove them from it.
 
-    def _build_genai_client(self, api_key: str, timeout_s: Optional[float] = None):
-        """Central google-genai client factory and the single decryption point.
+        Two injection formats are recognised, because OpenWebUI changed shape:
+          * ``<memory_context>...</memory_context>`` (current, utils/memory.py)
+            - can sit anywhere in the system message.
+          * ``\\nUser Context:\\n...`` (legacy) - runs to the end of the string.
 
-        Every request path (model listing, generation, Files API, tasks) builds
-        its client here so GEMINI_BASE_URL and the request timeout stay
-        consistent. Resolves ``genai.Client`` from module scope on purpose so
-        tests can monkeypatch it.
+        Both are re-retrieved and re-ranked per request, so they are never
+        stable across turns. Leaving them in the system prompt costs a full
+        prefix rewrite every turn; the caller relocates the return value to
+        the last user message instead.
+
+        Returns:
+            tuple[str, Optional[str]]: (cleaned_text, extracted_context)
+            - cleaned_text: original text with all memory blocks removed (stripped)
+            - extracted_context: the extracted memories, or None if none found
         """
-        if genai is None:
-            raise RuntimeError("google-genai is not installed")
-        key = decrypt_valve_secret(api_key).strip()
-        if not key:
-            raise ValueError("No Gemini API key configured")
-        opts: Dict[str, Any] = {
-            "timeout": int((timeout_s or self.valves.REQUEST_TIMEOUT) * 1000),
-            "retry_options": gtypes.HttpRetryOptions(attempts=1),
-        }
-        base_url = (self.valves.GEMINI_BASE_URL or "").strip()
-        if base_url:
-            opts["base_url"] = base_url
-        # Only fields the installed SDK version actually knows: proxies and
-        # older releases reject unknown HttpOptions keys.
-        opts = {k: v for k, v in opts.items() if k in gtypes.HttpOptions.model_fields}
-        return genai.Client(
-            api_key=key, vertexai=False, http_options=gtypes.HttpOptions(**opts)
-        )
+        # Fast path: two substring scans are far cheaper than two regex scans,
+        # and presence of the marker is the ground truth. Deliberately *not*
+        # gated on a config flag - OpenWebUI decides to inject based on the
+        # request's features.memory plus an admin-level config, neither of
+        # which the pipe can observe reliably.
+        if "<memory_context>" not in text and "User Context:" not in text:
+            return text.strip(), None
 
-    def _resolve_api_key(self, user_valves) -> str:
-        """The user's stored key if non-empty, else the admin key.
+        extracted_parts: List[str] = []
 
-        Both come back still encrypted; decryption happens in
-        ``_build_genai_client`` only.
+        # <memory_context> may appear anywhere; strip every occurrence.
+        def _take_memory_context(match) -> str:
+            content = match.group(1).strip()
+            if content:
+                extracted_parts.append(content)
+            return ""
+
+        cleaned_text = PATTERN_MEMORY_CONTEXT.sub(_take_memory_context, text)
+
+        # Legacy tail form.
+        match = PATTERN_USER_CONTEXT.search(cleaned_text)
+        if match:
+            context_content = match.group(1).strip()
+            if context_content:
+                extracted_parts.append(f"User Context:\n{context_content}")
+            # Remove "\nUser Context:\n" and everything after it.
+            cleaned_text = cleaned_text[: match.start()]
+
+        extracted_context = "\n\n".join(extracted_parts) if extracted_parts else None
+        return cleaned_text.strip(), extracted_context
+
+    def _create_metadata_marker(self, id: str, value: str, messagenum: int = 0) -> str:
+        """Build a URL-encoded inline metadata marker for embedding in
+        assistant text; it renders as nothing but round-trips the payload."""
+        encoded_value = quote(value, safe="")
+        return f" [](gemini:{messagenum}:{id}:{encoded_value}) "
+
+    def _extract_metadata_marker_from_message(self, message) -> List[str]:
+        """Extract the metadata payloads from the last assistant message and
+        remove the markers from it in place."""
+        metadata: List[str] = []
+        if not isinstance(message, dict):
+            return metadata
+        if message.get("role") != "assistant":
+            return metadata
+        content = message.get("content")
+        if isinstance(content, list):
+            # Join all text blocks for searching, but also update blocks in-place.
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    block_text = block.get("text", "")
+                    metadata.extend(self._METADATA_MARKER.findall(block_text))
+                    block["text"] = self._METADATA_MARKER.sub("", block_text)
+        elif isinstance(content, str):
+            metadata.extend(self._METADATA_MARKER.findall(content))
+            message["content"] = self._METADATA_MARKER.sub("", content)
+        return metadata
+
+    _IMAGE_SEND_AS_IS = (
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/heic",
+        "image/heif",
+    )
+    _IMAGE_CONVERT_TO_PNG = ("image/gif", "image/bmp", "image/tiff", "image/avif")
+
+    _PATTERN_METADATA_MARKER = re.compile(PATTERN_METADATA_MARKER)
+    _PATTERN_REASONING_DETAILS = re.compile(
+        r'<details\b[^>]*\btype="reasoning"[^>]*>.*?</details>', flags=re.DOTALL
+    )
+    _PATTERN_BUILTIN_DETAILS = re.compile(
+        r'<details\b[^>]*\bdata-gemini-builtin="1"[^>]*>.*?</details>',
+        flags=re.DOTALL,
+    )
+    _PATTERN_TOOL_CALLS_DETAILS = re.compile(
+        r'<details\b[^>]*\btype="tool_calls"[^>]*>.*?</details>', flags=re.DOTALL
+    )
+    _PATTERN_FILES_URL = re.compile(r"/api/v1/files/([0-9a-fA-F-]+)/content")
+    _PATTERN_DATA_URL = re.compile(r"^data:[^,]*;base64,(.*)$", flags=re.DOTALL)
+    _PATTERN_CITATION_RUN = re.compile(r"(?:\[\d+\])+")
+    _PATTERN_CODE_SPANS = re.compile(r"```.*?```|`[^`\n]*`", flags=re.DOTALL)
+    _SUGGESTION_LINE_PREFIX = "🔎 **Google Search suggestions:**"
+    _NOTICE_LINE_PREFIX = "> ⚠️"
+
+    async def _convert_history(
+        self, messages, info, ctx
+    ) -> Tuple[Optional[str], List[gtypes.Content]]:
+        """The system instruction and the Gemini Contents for one request.
+
+        Memories are extracted out of the system prompt and appended to the
+        last user message instead: they are re-ranked per request, so they
+        must not churn the (cacheable) system prefix.
         """
-        user_key = ""
-        if user_valves:
-            value = (
-                user_valves.get("GEMINI_API_KEY")
-                if isinstance(user_valves, dict)
-                else getattr(user_valves, "GEMINI_API_KEY", "")
+        messages = messages or []
+        last_user_index = -1
+        for i, message in enumerate(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                last_user_index = i
+
+        system_parts: List[str] = []
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                text = self._block_text(message.get("content", ""))
+                if text.strip():
+                    system_parts.append(text.strip())
+        system_instruction = "\n\n".join(system_parts).strip() or None
+
+        memories: Optional[str] = None
+        if system_instruction:
+            system_instruction, memories = self._extract_and_remove_memories(
+                system_instruction
             )
-            user_key = str(value or "").strip()
-        return user_key or str(self.valves.GEMINI_API_KEY or "")
+            if not system_instruction:
+                system_instruction = None
 
-    def _api_key_fingerprint(self, api_key: str) -> str:
-        """sha1 hex of the stored (possibly encrypted) key, for logging."""
-        return hashlib.sha1(str(api_key or "").encode("utf-8")).hexdigest()
+        contents: List[gtypes.Content] = []
+        for i, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role == "user":
+                parts = await self._user_parts(message.get("content", ""), ctx)
+                if memories is not None and i == last_user_index:
+                    parts = self._append_memories(parts, memories)
+                if parts:
+                    contents.append(gtypes.Content(role="user", parts=parts))
+            elif role == "assistant":
+                text = self._assistant_text(message.get("content", ""))
+                if text:
+                    contents.append(
+                        gtypes.Content(role="model", parts=[gtypes.Part(text=text)])
+                    )
 
-    def _model_name_from_body(self, body) -> str:
-        return body["model"].split("/")[-1]
-
-    @staticmethod
-    def _parse_generation(name: str) -> Optional[float]:
-        """Major.minor from the first ``gemini-<N>.<M>``; None when absent."""
-        match = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
-        return float(match.group(1)) if match else None
-
-    def _is_chat_model(self, d: dict) -> bool:
-        raw_name = str(d.get("name") or "")
-        name = raw_name[len("models/"):] if raw_name.startswith("models/") else raw_name
-        actions = d.get("supported_actions")
-        if actions and "generateContent" not in actions:
-            return False
-        if not name.startswith("gemini-"):
-            return False
-        lowered = name.lower()
-        for token in self._CHAT_MODEL_REJECT_TOKENS:
-            if token in lowered:
-                return False
-        generation = self._parse_generation(name)
-        if generation is not None:
-            return generation >= 2.5
-        return "nano-banana" in name
-
-    def _derive_capabilities(self, name: str, api_model: Optional[dict] = None) -> dict:
-        """Capabilities for one model: rules, then pins, then the valve overrides."""
-        api_model = api_model or {}
-        if "image" in name or "nano-banana" in name:
-            family = "image"
-        elif "flash-lite" in name:
-            family = "flash-lite"
-        elif "flash" in name:
-            family = "flash"
-        elif "pro" in name:
-            family = "pro"
-        else:
-            family = "other"
-
-        generation = self._parse_generation(name)
-        if generation is None:
-            generation = 3.0
-
-        if api_model.get("thinking") is False:
-            thinking = "none"
-        elif family == "image":
-            thinking = "always"
-        elif generation < 3:
-            thinking = "budget"
-        else:
-            thinking = "level"
-
-        if thinking == "level":
-            thinking_levels = ["low", "medium", "high"]
-            if (
-                family == "flash-lite"
-                or name.startswith("gemini-3.6-flash")
-                or name.startswith("gemini-3-flash")
-            ):
-                thinking_levels = ["minimal"] + thinking_levels
-        else:
-            thinking_levels = []
-
-        if generation == 2.5:
-            if family == "pro":
-                budget_range = [128, 32768]
-            elif family == "flash":
-                budget_range = [0, 24576]
-            elif family == "flash-lite":
-                budget_range = [512, 24576]
+        merged: List[gtypes.Content] = []
+        for content in contents:
+            if not content.parts:
+                continue
+            if merged and merged[-1].role == content.role:
+                merged[-1].parts.extend(content.parts)
             else:
-                budget_range = None
-        else:
-            budget_range = None
-
-        image_out = family == "image"
-        info = {
-            "generation": generation,
-            "family": family,
-            "thinking": thinking,
-            "thinking_levels": thinking_levels,
-            "budget_range": budget_range,
-            "thinking_can_disable": generation == 2.5 and family in ("flash", "flash-lite"),
-            "search": not (family == "image" and "flash-lite" in name),
-            "url_context": not image_out,
-            "maps": not image_out,
-            "maps_with_search": generation >= 3.5,
-            "functions": not image_out,
-            "builtin_with_functions": bool(
-                not image_out
-                and generation >= 3
-                and GENAI_HAS_SERVER_SIDE_INVOCATIONS
-                and GENAI_HAS_TOOL_CALL_PARTS
-            ),
-            "image_out": image_out,
-            "image_sizes": ["1K", "2K", "4K"] if image_out else [],
-            "context_length": api_model.get("input_token_limit") or 1048576,
-            "max_output": api_model.get("output_token_limit") or 65536,
-        }
-        self._apply_capability_patterns(info, Pipe.MODEL_CAPABILITY_PINS, name)
-        self._apply_capability_patterns(info, self._model_capability_overrides(), name)
-        return info
-
-    def _model_capability_overrides(self) -> dict:
-        """The MODEL_CAPABILITY_OVERRIDES valve parsed; invalid JSON is ignored."""
-        raw = (self.valves.MODEL_CAPABILITY_OVERRIDES or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except (TypeError, ValueError) as e:
-            logger.warning(f"MODEL_CAPABILITY_OVERRIDES is not valid JSON; ignored: {e}")
-            return {}
-        if not isinstance(parsed, dict):
-            logger.warning("MODEL_CAPABILITY_OVERRIDES must be a JSON object; ignored")
-            return {}
-        return {
-            str(pattern): values
-            for pattern, values in parsed.items()
-            if isinstance(values, dict)
-        }
-
-    def _apply_capability_patterns(self, info: dict, table: dict, name: str) -> None:
-        """Apply {pattern: {key: value}} entries; a trailing * is a prefix match.
-
-        All matching patterns apply, shortest pattern first, so a specific
-        "gemini-2.5*" rule is not clobbered by a broad "gemini-*" one.
-        """
-        matches = []
-        for pattern in table:
-            if pattern.endswith("*"):
-                if name.startswith(pattern[:-1]):
-                    matches.append((len(pattern), pattern))
-            elif pattern == name:
-                matches.append((len(pattern), pattern))
-        for _length, pattern in sorted(matches):
-            info.update(table[pattern])
-
-    def get_model_info(self, name: str) -> dict:
-        """Capabilities by model name, from the API cache when discovered."""
-        return self._derive_capabilities(name, Pipe._api_models.get(name))
-
-    def _model_cache_signature(self) -> str:
-        """Fingerprint of the settings the model list depends on.
-
-        Uses the stored (possibly encrypted) values rather than decrypting: the
-        stored values are stable between saves, and decrypting could raise on a
-        rotated WEBUI_SECRET_KEY and take the model list down with it.
-        """
-        parts = [
-            (self.valves.GEMINI_API_KEY or "").strip(),
-            (self.valves.GEMINI_BASE_URL or "").strip(),
-            (self.valves.ENABLED_MODELS or "").strip(),
-            (self.valves.MODEL_CAPABILITY_OVERRIDES or "").strip(),
-        ]
-        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
-
-    async def get_gemini_models(self) -> List[dict]:
-        """Discover the chat models via the API and cache the result.
-
-        The cache lives on the class: one Pipe instance serves all users, and a
-        per-request cache would refetch on every ``pipes()`` call.
-        """
-        enabled_raw = (self.valves.ENABLED_MODELS or "").strip()
-        if enabled_raw:
-            # Explicit allow-list: endpoints without a model-listing route can
-            # still surface their models, and no API call is spent.
-            enabled = [m.strip() for m in enabled_raw.split(",") if m.strip()]
-            return [
-                self._build_openwebui_model_entry(name, self.get_model_info(name))
-                for name in enabled
-            ]
-
-        if not str(self.valves.GEMINI_API_KEY or "").strip():
-            return [{"id": "gemini/error", "name": "Gemini: set GEMINI_API_KEY"}]
-
-        cache_sig = self._model_cache_signature()
-        ttl = int(self.valves.MODEL_CACHE_TTL_MINUTES or 0) * 60
-        if (
-            Pipe._model_cache
-            and Pipe._model_cache_sig == cache_sig
-            and ttl > 0
-            and time.time() - Pipe._model_cache_ts < ttl
-        ):
-            return list(Pipe._model_cache)
-
-        entries: List[dict] = []
-        try:
-            client = self._build_genai_client(self.valves.GEMINI_API_KEY)
-            async for model in await client.aio.models.list(config={"page_size": 1000}):
-                d = model.model_dump()
-                raw_name = str(d.get("name") or "")
-                name = raw_name[len("models/"):] if raw_name.startswith("models/") else raw_name
-                if not name or not self._is_chat_model(d):
-                    continue
-                info = self._derive_capabilities(name, d)
-                Pipe._api_models[name] = d
-                entries.append(
-                    self._build_openwebui_model_entry(name, info, str(d.get("display_name") or ""))
-                )
-
-            if not entries:
-                logger.warning("Model listing returned no chat models; using static fallback")
-                return self._static_fallback_models()
-
-            Pipe._model_cache = list(entries)
-            Pipe._model_cache_ts = time.time()
-            Pipe._model_cache_sig = cache_sig
-            logger.info(f"Cached model list: {len(entries)} chat models")
-            return entries
-        except Exception as e:
-            logger.warning(f"Could not fetch models from the Gemini API: {e}")
-            # A stale cache from the same settings still lists this endpoint's
-            # models; one from different settings would not, so a changed
-            # signature drops through to the static fallback.
-            if Pipe._model_cache and Pipe._model_cache_sig == cache_sig:
-                logger.info("Using stale model list cache as fallback")
-                return list(Pipe._model_cache)
-            return self._static_fallback_models()
+                merged.append(content)
+        return system_instruction, merged
 
     @staticmethod
-    def _build_openwebui_model_entry(name: str, info: dict, display_name: str = "") -> dict:
-        return {
-            "id": MODEL_ID_PREFIX + name,
-            "name": display_name or name,
-            "context_length": info["context_length"],
-            "max_output_tokens": info["max_output"],
-            "supports_vision": True,
-            "supports_thinking": info["thinking"] != "none",
-            "info": {"meta": {"capabilities": {"status_updates": True}}},
-        }
+    def _block_text(content: Any) -> str:
+        """The prose of a message content: the string itself, or its text blocks."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return ""
 
-    def _static_fallback_models(self) -> List[dict]:
-        return [
-            self._build_openwebui_model_entry(name, self.get_model_info(name))
-            for name in self._STATIC_FALLBACK_MODELS
-        ]
+    async def _user_parts(self, content: Any, ctx) -> List[gtypes.Part]:
+        """The parts of one user message: text as-is, images as inline_data."""
+        parts: List[gtypes.Part] = []
+        if isinstance(content, str):
+            if content:
+                parts.append(gtypes.Part(text=content))
+            return parts
+        if not isinstance(content, list):
+            return parts
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text") or ""
+                if text:
+                    parts.append(gtypes.Part(text=text))
+            elif block_type == "image_url":
+                url = (block.get("image_url") or {}).get("url") or ""
+                part = await self._image_part(url)
+                if part is not None:
+                    parts.append(part)
+        return parts
 
-    async def pipes(self) -> List[dict]:
-        """OpenWebUI entry point returning the list of available Gemini models."""
-        return await self.get_gemini_models()
+    def _append_memories(
+        self, parts: List[gtypes.Part], memories: str
+    ) -> List[gtypes.Part]:
+        """Append the relocated memories under the standard header, after the
+        last text part of the message (or as a new part when there is none)."""
+        suffix = MEMORY_CONTEXT_APPENDIX_HEADER + memories
+        for index in range(len(parts) - 1, -1, -1):
+            if parts[index].text:
+                parts[index] = gtypes.Part(text=parts[index].text + suffix)
+                return parts
+        parts.append(gtypes.Part(text=suffix))
+        return parts
+
+    async def _image_part(self, url: str) -> Optional[gtypes.Part]:
+        """The inline_data part for one image URL, or None when it cannot be
+        sent (fetch failure, unrecognised type, no converter)."""
+        if not url:
+            return None
+        file_match = self._PATTERN_FILES_URL.search(url)
+        if url.startswith("data:"):
+            data = self._decode_data_url(url)
+        elif FILES_AVAILABLE and file_match:
+            data = await self._read_file_bytes(file_match.group(1))
+        elif url.startswith(("http://", "https://")):
+            data = await self._fetch_url_image(url)
+        else:
+            return None
+        if data is None:
+            return None
+        prepared = self._prepare_image_bytes(data, self._sniff_image_media_type(data))
+        if prepared is None:
+            return None
+        image_bytes, mime_type = prepared
+        return gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+
+    @classmethod
+    def _decode_data_url(cls, url: str) -> Optional[bytes]:
+        match = cls._PATTERN_DATA_URL.match(url)
+        if not match:
+            logger.debug("skipping image: not a base64 data URL")
+            return None
+        try:
+            return base64.b64decode(match.group(1))
+        except Exception as e:
+            logger.debug(f"skipping image: invalid base64 data URL: {e}")
+            return None
+
+    @staticmethod
+    async def _read_file_bytes(file_id: str) -> Optional[bytes]:
+        """The bytes behind an /api/v1/files/<uuid>/content URL, via OpenWebUI's
+        Files registry and storage provider."""
+        try:
+            file = await Files.get_file_by_id(id=file_id)
+        except Exception as e:
+            logger.warning(f"could not look up file {file_id}: {e}")
+            return None
+        if file is None:
+            logger.debug(f"skipping image: unknown file id {file_id}")
+            return None
+        location = getattr(file, "path", None)
+        if not location:
+            logger.debug(f"skipping image: file {file_id} has no storage location")
+            return None
+        try:
+            path = Storage.get_file(location)
+            with open(path, "rb") as handle:
+                return handle.read()
+        except Exception as e:
+            logger.warning(f"could not read file {file_id}: {e}")
+            return None
+
+    @staticmethod
+    async def _fetch_url_image(url: str) -> Optional[bytes]:
+        """The bytes of an http(s) image URL, through OpenWebUI's SSRF-safe
+        fetcher; None when the fetcher is absent or the fetch fails."""
+        if not IMAGE_URL_FETCH_AVAILABLE:
+            logger.debug("skipping image URL: the OpenWebUI fetcher is not available")
+            return None
+        try:
+            encoded = await get_image_base64_from_url(url)
+        except Exception as e:
+            logger.warning(f"could not fetch image URL {url}: {e}")
+            return None
+        if not encoded:
+            logger.debug(f"skipping image URL: empty fetch result for {url}")
+            return None
+        try:
+            return base64.b64decode(encoded)
+        except Exception as e:
+            logger.debug(f"skipping image URL: invalid base64 from {url}: {e}")
+            return None
+
+    def _prepare_image_bytes(
+        self, data: bytes, mime_type: Optional[str]
+    ) -> Optional[Tuple[bytes, str]]:
+        """(bytes, mime) ready to send, or None: types the API takes are sent
+        as-is, GIF/BMP/TIFF/AVIF are converted to PNG when Pillow is
+        installed, and anything else is skipped."""
+        if not mime_type:
+            logger.debug("skipping image: unrecognised image type")
+            return None
+        if mime_type in self._IMAGE_SEND_AS_IS:
+            return data, mime_type
+        if mime_type in self._IMAGE_CONVERT_TO_PNG:
+            if not PIL_AVAILABLE:
+                logger.warning(
+                    f"skipping {mime_type} image: Pillow is not installed, "
+                    "so it cannot be converted to PNG"
+                )
+                return None
+            try:
+                image = PILImage.open(io.BytesIO(data))
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                return buffer.getvalue(), "image/png"
+            except Exception as e:
+                logger.warning(f"skipping {mime_type} image: conversion to PNG failed: {e}")
+                return None
+        logger.debug(f"skipping image: unsupported type {mime_type}")
+        return None
+
+    @staticmethod
+    def _sniff_image_media_type(raw: bytes) -> Optional[str]:
+        """Identify an image from its leading bytes, ignoring any declared type.
+
+        Necessary because OpenWebUI's label is wrong in two different ways
+        (both in MessageInput.svelte):
+
+          * Its HEIC branch tests `file.type === 'image/heic'` exactly, so
+            `image/heif`, the `*-sequence` variants, and the very common case
+            of an empty `file.type` skip conversion entirely.
+          * When conversion DOES run, the resulting JPEG is re-wrapped with
+            `new File([blob], name, { type: file.type })` -- the ORIGINAL type.
+            So a successfully converted image still arrives labelled HEIC.
+
+        The bytes are the only reliable source.
+        """
+        if raw.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if raw[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return "image/webp"
+        # ISO-BMFF: size, then "ftyp", then the brand.
+        if raw[4:8] == b"ftyp":
+            brand = raw[8:12]
+            if brand in (b"avif", b"avis"):
+                return "image/avif"
+            if brand in (b"heic", b"heix", b"heim", b"heis", b"heif", b"mif1"):
+                return "image/heic"
+        return None
+
+    def _assistant_text(self, content: Any) -> str:
+        """The replayable prose of an assistant message: its persisted text
+        minus everything this pipe rendered into it."""
+        text = self._block_text(content)
+        if not text:
+            return ""
+        had_search_block = 'name="google_search"' in text
+        text = self._PATTERN_METADATA_MARKER.sub("", text)
+        text = self._PATTERN_REASONING_DETAILS.sub("", text)
+        text = self._PATTERN_BUILTIN_DETAILS.sub("", text)
+        text = self._PATTERN_TOOL_CALLS_DETAILS.sub("", text)
+        text = self._strip_decorative_lines(text)
+        if had_search_block:
+            # Citation numbers are only valid within the call that produced
+            # them; replayed text would point at the wrong sources, so the
+            # markers go away with the search block.
+            text = self._strip_citation_runs(text)
+        return text.strip()
+
+    def _strip_decorative_lines(self, text: str) -> str:
+        kept = []
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith(self._SUGGESTION_LINE_PREFIX):
+                continue
+            if stripped.startswith(self._NOTICE_LINE_PREFIX):
+                continue
+            kept.append(line)
+        return "\n".join(kept)
+
+    def _strip_citation_runs(self, text: str) -> str:
+        """Drop the [n] citation runs outside inline code and fenced blocks."""
+        parts = self._PATTERN_CODE_SPANS.split(text)
+        return "".join(
+            self._PATTERN_CITATION_RUN.sub("", seg) if idx % 2 == 0 else seg
+            for idx, seg in enumerate(parts)
+        )
 
     _PATTERN_URL = re.compile(r"https?://[^\s<>\"')\]]+")
 
@@ -2077,5 +2192,671 @@ class Pipe:
     def _format_notice(self, text: str) -> str:
         """A short warning line appended to the answer (degraded capability, …)."""
         return "\n> ⚠️ " + text + "\n"
+
+    # Model names containing any of these are not chat models, whatever the
+    # API metadata says (embeddings, TTS, video, audio, agents, open models).
+    _CHAT_MODEL_REJECT_TOKENS = (
+        "embedding",
+        "aqa",
+        "tts",
+        "native-audio",
+        "live",
+        "lyria",
+        "veo",
+        "imagen",
+        "computer-use",
+        "robotics",
+        "deep-research",
+        "agent",
+        "learnlm",
+        "gemma",
+        "transcribe",
+        "omni",
+    )
+
+    # Served when live discovery fails with no usable cache and the endpoint
+    # returned no models: the chat models a default install can expect.
+    _STATIC_FALLBACK_MODELS = (
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-nano-banana-2.1",
+    )
+
+    def _build_genai_client(self, api_key: str, timeout_s: Optional[float] = None):
+        """Central google-genai client factory and the single decryption point.
+
+        Every request path (model listing, generation, Files API, tasks) builds
+        its client here so GEMINI_BASE_URL and the request timeout stay
+        consistent. Resolves ``genai.Client`` from module scope on purpose so
+        tests can monkeypatch it.
+        """
+        if genai is None:
+            raise RuntimeError("google-genai is not installed")
+        key = decrypt_valve_secret(api_key).strip()
+        if not key:
+            raise ValueError("No Gemini API key configured")
+        opts: Dict[str, Any] = {
+            "timeout": int((timeout_s or self.valves.REQUEST_TIMEOUT) * 1000),
+            "retry_options": gtypes.HttpRetryOptions(attempts=1),
+        }
+        base_url = (self.valves.GEMINI_BASE_URL or "").strip()
+        if base_url:
+            opts["base_url"] = base_url
+        # Only fields the installed SDK version actually knows: proxies and
+        # older releases reject unknown HttpOptions keys.
+        opts = {k: v for k, v in opts.items() if k in gtypes.HttpOptions.model_fields}
+        return genai.Client(
+            api_key=key, vertexai=False, http_options=gtypes.HttpOptions(**opts)
+        )
+
+    def _resolve_api_key(self, user_valves) -> str:
+        """The user's stored key if non-empty, else the admin key.
+
+        Both come back still encrypted; decryption happens in
+        ``_build_genai_client`` only.
+        """
+        user_key = ""
+        if user_valves:
+            value = (
+                user_valves.get("GEMINI_API_KEY")
+                if isinstance(user_valves, dict)
+                else getattr(user_valves, "GEMINI_API_KEY", "")
+            )
+            user_key = str(value or "").strip()
+        return user_key or str(self.valves.GEMINI_API_KEY or "")
+
+    def _api_key_fingerprint(self, api_key: str) -> str:
+        """sha1 hex of the stored (possibly encrypted) key, for logging."""
+        return hashlib.sha1(str(api_key or "").encode("utf-8")).hexdigest()
+
+    def _model_name_from_body(self, body) -> str:
+        return body["model"].split("/")[-1]
+
+    @staticmethod
+    def _parse_generation(name: str) -> Optional[float]:
+        """Major.minor from the first ``gemini-<N>.<M>``; None when absent."""
+        match = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+        return float(match.group(1)) if match else None
+
+    def _is_chat_model(self, d: dict) -> bool:
+        raw_name = str(d.get("name") or "")
+        name = raw_name[len("models/"):] if raw_name.startswith("models/") else raw_name
+        actions = d.get("supported_actions")
+        if actions and "generateContent" not in actions:
+            return False
+        if not name.startswith("gemini-"):
+            return False
+        lowered = name.lower()
+        for token in self._CHAT_MODEL_REJECT_TOKENS:
+            if token in lowered:
+                return False
+        generation = self._parse_generation(name)
+        if generation is not None:
+            return generation >= 2.5
+        return "nano-banana" in name
+
+    def _derive_capabilities(self, name: str, api_model: Optional[dict] = None) -> dict:
+        """Capabilities for one model: rules, then pins, then the valve overrides."""
+        api_model = api_model or {}
+        if "image" in name or "nano-banana" in name:
+            family = "image"
+        elif "flash-lite" in name:
+            family = "flash-lite"
+        elif "flash" in name:
+            family = "flash"
+        elif "pro" in name:
+            family = "pro"
+        else:
+            family = "other"
+
+        generation = self._parse_generation(name)
+        if generation is None:
+            generation = 3.0
+
+        if api_model.get("thinking") is False:
+            thinking = "none"
+        elif family == "image":
+            thinking = "always"
+        elif generation < 3:
+            thinking = "budget"
+        else:
+            thinking = "level"
+
+        if thinking == "level":
+            thinking_levels = ["low", "medium", "high"]
+            if (
+                family == "flash-lite"
+                or name.startswith("gemini-3.6-flash")
+                or name.startswith("gemini-3-flash")
+            ):
+                thinking_levels = ["minimal"] + thinking_levels
+        else:
+            thinking_levels = []
+
+        if generation == 2.5:
+            if family == "pro":
+                budget_range = [128, 32768]
+            elif family == "flash":
+                budget_range = [0, 24576]
+            elif family == "flash-lite":
+                budget_range = [512, 24576]
+            else:
+                budget_range = None
+        else:
+            budget_range = None
+
+        image_out = family == "image"
+        info = {
+            "generation": generation,
+            "family": family,
+            "thinking": thinking,
+            "thinking_levels": thinking_levels,
+            "budget_range": budget_range,
+            "thinking_can_disable": generation == 2.5 and family in ("flash", "flash-lite"),
+            "search": not (family == "image" and "flash-lite" in name),
+            "url_context": not image_out,
+            "maps": not image_out,
+            "maps_with_search": generation >= 3.5,
+            "functions": not image_out,
+            "builtin_with_functions": bool(
+                not image_out
+                and generation >= 3
+                and GENAI_HAS_SERVER_SIDE_INVOCATIONS
+                and GENAI_HAS_TOOL_CALL_PARTS
+            ),
+            "image_out": image_out,
+            "image_sizes": ["1K", "2K", "4K"] if image_out else [],
+            "context_length": api_model.get("input_token_limit") or 1048576,
+            "max_output": api_model.get("output_token_limit") or 65536,
+        }
+        self._apply_capability_patterns(info, Pipe.MODEL_CAPABILITY_PINS, name)
+        self._apply_capability_patterns(info, self._model_capability_overrides(), name)
+        return info
+
+    def _model_capability_overrides(self) -> dict:
+        """The MODEL_CAPABILITY_OVERRIDES valve parsed; invalid JSON is ignored."""
+        raw = (self.valves.MODEL_CAPABILITY_OVERRIDES or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"MODEL_CAPABILITY_OVERRIDES is not valid JSON; ignored: {e}")
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning("MODEL_CAPABILITY_OVERRIDES must be a JSON object; ignored")
+            return {}
+        return {
+            str(pattern): values
+            for pattern, values in parsed.items()
+            if isinstance(values, dict)
+        }
+
+    def _apply_capability_patterns(self, info: dict, table: dict, name: str) -> None:
+        """Apply {pattern: {key: value}} entries; a trailing * is a prefix match.
+
+        All matching patterns apply, shortest pattern first, so a specific
+        "gemini-2.5*" rule is not clobbered by a broad "gemini-*" one.
+        """
+        matches = []
+        for pattern in table:
+            if pattern.endswith("*"):
+                if name.startswith(pattern[:-1]):
+                    matches.append((len(pattern), pattern))
+            elif pattern == name:
+                matches.append((len(pattern), pattern))
+        for _length, pattern in sorted(matches):
+            info.update(table[pattern])
+
+    def get_model_info(self, name: str) -> dict:
+        """Capabilities by model name, from the API cache when discovered."""
+        return self._derive_capabilities(name, Pipe._api_models.get(name))
+
+    def _model_cache_signature(self) -> str:
+        """Fingerprint of the settings the model list depends on.
+
+        Uses the stored (possibly encrypted) values rather than decrypting: the
+        stored values are stable between saves, and decrypting could raise on a
+        rotated WEBUI_SECRET_KEY and take the model list down with it.
+        """
+        parts = [
+            (self.valves.GEMINI_API_KEY or "").strip(),
+            (self.valves.GEMINI_BASE_URL or "").strip(),
+            (self.valves.ENABLED_MODELS or "").strip(),
+            (self.valves.MODEL_CAPABILITY_OVERRIDES or "").strip(),
+        ]
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+    async def get_gemini_models(self) -> List[dict]:
+        """Discover the chat models via the API and cache the result.
+
+        The cache lives on the class: one Pipe instance serves all users, and a
+        per-request cache would refetch on every ``pipes()`` call.
+        """
+        enabled_raw = (self.valves.ENABLED_MODELS or "").strip()
+        if enabled_raw:
+            # Explicit allow-list: endpoints without a model-listing route can
+            # still surface their models, and no API call is spent.
+            enabled = [m.strip() for m in enabled_raw.split(",") if m.strip()]
+            return [
+                self._build_openwebui_model_entry(name, self.get_model_info(name))
+                for name in enabled
+            ]
+
+        if not str(self.valves.GEMINI_API_KEY or "").strip():
+            return [{"id": "gemini/error", "name": "Gemini: set GEMINI_API_KEY"}]
+
+        cache_sig = self._model_cache_signature()
+        ttl = int(self.valves.MODEL_CACHE_TTL_MINUTES or 0) * 60
+        if (
+            Pipe._model_cache
+            and Pipe._model_cache_sig == cache_sig
+            and ttl > 0
+            and time.time() - Pipe._model_cache_ts < ttl
+        ):
+            return list(Pipe._model_cache)
+
+        entries: List[dict] = []
+        try:
+            client = self._build_genai_client(self.valves.GEMINI_API_KEY)
+            async for model in await client.aio.models.list(config={"page_size": 1000}):
+                d = model.model_dump()
+                raw_name = str(d.get("name") or "")
+                name = raw_name[len("models/"):] if raw_name.startswith("models/") else raw_name
+                if not name or not self._is_chat_model(d):
+                    continue
+                info = self._derive_capabilities(name, d)
+                Pipe._api_models[name] = d
+                entries.append(
+                    self._build_openwebui_model_entry(name, info, str(d.get("display_name") or ""))
+                )
+
+            if not entries:
+                logger.warning("Model listing returned no chat models; using static fallback")
+                return self._static_fallback_models()
+
+            Pipe._model_cache = list(entries)
+            Pipe._model_cache_ts = time.time()
+            Pipe._model_cache_sig = cache_sig
+            logger.info(f"Cached model list: {len(entries)} chat models")
+            return entries
+        except Exception as e:
+            logger.warning(f"Could not fetch models from the Gemini API: {e}")
+            # A stale cache from the same settings still lists this endpoint's
+            # models; one from different settings would not, so a changed
+            # signature drops through to the static fallback.
+            if Pipe._model_cache and Pipe._model_cache_sig == cache_sig:
+                logger.info("Using stale model list cache as fallback")
+                return list(Pipe._model_cache)
+            return self._static_fallback_models()
+
+    @staticmethod
+    def _build_openwebui_model_entry(name: str, info: dict, display_name: str = "") -> dict:
+        return {
+            "id": MODEL_ID_PREFIX + name,
+            "name": display_name or name,
+            "context_length": info["context_length"],
+            "max_output_tokens": info["max_output"],
+            "supports_vision": True,
+            "supports_thinking": info["thinking"] != "none",
+            "info": {"meta": {"capabilities": {"status_updates": True}}},
+        }
+
+    def _static_fallback_models(self) -> List[dict]:
+        return [
+            self._build_openwebui_model_entry(name, self.get_model_info(name))
+            for name in self._STATIC_FALLBACK_MODELS
+        ]
+
+    async def pipes(self) -> List[dict]:
+        """OpenWebUI entry point returning the list of available Gemini models."""
+        return await self.get_gemini_models()
+
+    # OpenWebUI's background memory review arrives as a task whose name is not
+    # in the TASKS enum -- functions.py forwards metadata.task verbatim.
+    MEMORY_REVIEW_TASK = "memory_review"
+
+    # Response schemas for the task requests whose prompt asks for raw JSON.
+    #
+    # OpenWebUI parses these answers with json.loads and drops the whole task
+    # when it fails, so every one of its prompts spends several lines begging
+    # for "no markdown fences, no preamble". Structured outputs make that a
+    # guarantee instead of a plea: the model cannot emit anything but a
+    # conforming object.
+    #
+    # Keys are the task names OpenWebUI passes in metadata.task. Deliberately
+    # absent: emoji_generation and moa_response_generation (their prompts ask
+    # for prose, not JSON).
+    #
+    # `additionalProperties: false` everywhere -- OpenWebUI reads exactly one
+    # key out of each of these and extra keys are pure token cost.
+    TASK_RESPONSE_SCHEMAS: Dict[str, dict] = {
+        "title_generation": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+        "tags_generation": {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["tags"],
+            "additionalProperties": False,
+        },
+        "follow_up_generation": {
+            "type": "object",
+            "properties": {
+                "follow_ups": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["follow_ups"],
+            "additionalProperties": False,
+        },
+        "query_generation": {
+            "type": "object",
+            "properties": {
+                "queries": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        },
+        "image_prompt_generation": {
+            "type": "object",
+            "properties": {"prompt": {"type": "string"}},
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+        "autocomplete_generation": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        MEMORY_REVIEW_TASK: {
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["add", "replace", "move", "remove"],
+                            },
+                            "id": {"type": "string"},
+                            "type": {"type": "string", "enum": ["user", "context"]},
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        # One flat object rather than a per-action union: the
+                        # required field set differs per action, and structured
+                        # outputs does not accept anyOf/oneOf. OpenWebUI
+                        # validates the per-action requirements itself
+                        # (validate_memory_operations), so pinning the action
+                        # vocabulary and the field names is the useful part --
+                        # it is what stops the model from inventing the
+                        # "score"/"importance"/"stability" keys the prompt
+                        # explicitly warns against.
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["operations"],
+            "additionalProperties": False,
+        },
+    }
+
+    _PATTERN_ANY_DETAILS = re.compile(
+        r"<details\b[^>]*>.*?</details>", flags=re.DOTALL
+    )
+    _PATTERN_METADATA_MARKER = re.compile(PATTERN_METADATA_MARKER)
+    _PATTERN_TRAILING_SPACES = re.compile(r"[ \t]+$", flags=re.MULTILINE)
+    _PATTERN_EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
+
+    def _resolve_task_model(self, body: dict) -> str:
+        """The model for a task request: the TASK_MODEL valve when set, else
+        the chat model of the body."""
+        chat_model = self._model_name_from_body(body)
+        override = str(self.valves.TASK_MODEL or "").strip()
+        if not override:
+            return chat_model
+        if override.startswith(MODEL_ID_PREFIX):
+            override = override[len(MODEL_ID_PREFIX) :]
+        return override
+
+    @classmethod
+    def _sanitize_task_text(cls, text: str) -> str:
+        """Reduce persisted chat content to the prose a task model actually
+        needs.
+
+        OpenWebUI hands task requests the stored message content, which carries
+        every collapsible this pipe ever wrote plus the invisible metadata
+        markers used for replay. None of it round-trips: task requests are
+        one-shot. Stripping it cuts the bill and stops the task model from
+        reasoning about its own UI artefacts. It matters most for the memory
+        review, which truncates each message and would otherwise spend that
+        budget on UI artefacts.
+        """
+        if not text or ("<" not in text and "[" not in text):
+            return text
+        cleaned = cls._PATTERN_ANY_DETAILS.sub("\n", text)
+        cleaned = cls._PATTERN_METADATA_MARKER.sub(" ", cleaned)
+        cleaned = cls._PATTERN_TRAILING_SPACES.sub("", cleaned)
+        return cls._PATTERN_EXCESS_BLANK_LINES.sub("\n\n", cleaned).strip()
+
+    @classmethod
+    def _extract_task_system(cls, messages: List[dict]) -> str:
+        """The system messages of a task request, joined into one string.
+
+        Returned as plain text: task requests are one-shot and never cached,
+        so there is nothing fancier to attach them to.
+        """
+        parts: List[str] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "system":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                continue
+            if text.strip():
+                parts.append(text.strip())
+        return "\n\n".join(parts)
+
+    def _process_messages_for_task(
+        self, messages: List[dict]
+    ) -> List[gtypes.Content]:
+        """The conversation as text-only Gemini Contents for a task request.
+
+        UI artefacts are stripped per message (see _sanitize_task_text); a
+        message that sanitises to nothing is dropped, and the same-role
+        neighbours a drop leaves behind are merged instead of being sent as
+        an invalid sequence.
+        """
+        processed: List[gtypes.Content] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "user":
+                gemini_role = "user"
+            elif role == "assistant":
+                gemini_role = "model"
+            else:
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                continue
+            text = self._sanitize_task_text(text)
+            if not text:
+                continue
+            if processed and processed[-1].role == gemini_role:
+                previous = processed[-1].parts[0].text
+                processed[-1].parts[0] = gtypes.Part(text=f"{previous}\n\n{text}")
+            else:
+                processed.append(
+                    gtypes.Content(role=gemini_role, parts=[gtypes.Part(text=text)])
+                )
+        return processed
+
+    def _task_config_kwargs(
+        self, info: dict, system_instruction: Optional[str], thinking, task: Optional[str]
+    ) -> Tuple[dict, bool]:
+        """The GenerateContentConfig kwargs for one task call, and whether the
+        structured-output fields are in them: no tools, AFC disabled, the
+        task's thinking config, and the task's response schema when it has
+        one."""
+        schema = (
+            self.TASK_RESPONSE_SCHEMAS.get(task) if isinstance(task, str) else None
+        )
+        kwargs: dict = {
+            "automatic_function_calling": gtypes.AutomaticFunctionCallingConfig(
+                disable=True
+            )
+        }
+        if system_instruction:
+            kwargs["system_instruction"] = system_instruction
+        if thinking is not None:
+            kwargs["thinking_config"] = thinking
+        if schema:
+            kwargs["response_mime_type"] = "application/json"
+            kwargs["response_json_schema"] = schema
+        return kwargs, bool(schema)
+
+    async def _task_generate(
+        self,
+        client,
+        model: str,
+        chat_model: str,
+        contents: List[gtypes.Content],
+        system_instruction: str,
+        user_valves,
+        body: dict,
+        task: Optional[str],
+    ):
+        """The task's generate_content call, with its two self-healing
+        retries: a 404 from the TASK_MODEL valve falls back to the chat
+        model, and any other failure drops the structured output and retries
+        once plain -- losing the schema costs a markdown fence, losing the
+        request costs the whole task."""
+        info = self.get_model_info(model)
+        kwargs, structured = self._task_config_kwargs(
+            info,
+            system_instruction,
+            self._build_thinking_config(info, user_valves, body, purpose="task"),
+            task,
+        )
+        try:
+            return await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=gtypes.GenerateContentConfig(**kwargs),
+            )
+        except genai_errors.APIError as e:
+            if getattr(e, "code", None) == 404 and model != chat_model:
+                logger.info(
+                    f"Task model {model} not found; retrying with the chat model {chat_model}"
+                )
+                info = self.get_model_info(chat_model)
+                kwargs, _structured = self._task_config_kwargs(
+                    info,
+                    system_instruction,
+                    self._build_thinking_config(
+                        info, user_valves, body, purpose="task"
+                    ),
+                    task,
+                )
+                return await client.aio.models.generate_content(
+                    model=chat_model,
+                    contents=contents,
+                    config=gtypes.GenerateContentConfig(**kwargs),
+                )
+            if structured:
+                logger.warning(
+                    f"Task {task} rejected with structured outputs, retrying "
+                    f"without: {getattr(e, 'message', e)}"
+                )
+                kwargs.pop("response_mime_type", None)
+                kwargs.pop("response_json_schema", None)
+                return await client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=gtypes.GenerateContentConfig(**kwargs),
+                )
+            raise
+
+    async def _run_task(self, body, task, __user__, user_valves) -> str:
+        """One non-streaming task request (title, tags, follow-ups, ...).
+
+        Returns the answer's non-thought text, stripped, or "" when the task
+        failed: OpenWebUI drops failed tasks silently, so a total task outage
+        must still leave a warning behind.
+        """
+        client = None
+        try:
+            body = body or {}
+            user_valves = self.UserValves() if user_valves is None else user_valves
+            api_key = self._resolve_api_key(user_valves)
+            client = self._build_genai_client(
+                api_key, timeout_s=self.valves.REQUEST_TIMEOUT
+            )
+            messages = body.get("messages") or []
+            contents = self._process_messages_for_task(messages)
+            system_instruction = self._extract_task_system(messages)
+            if not contents:
+                return ""
+            response = await self._task_generate(
+                client,
+                self._resolve_task_model(body),
+                self._model_name_from_body(body),
+                contents,
+                system_instruction,
+                user_valves,
+                body,
+                task,
+            )
+        except Exception as e:
+            # Warning, not debug: returning "" makes OpenWebUI drop the task
+            # silently, so a total task outage must be visible at default log
+            # settings.
+            logger.warning(f"Task model error ({task}): {e}")
+            return ""
+        finally:
+            if client is not None:
+                try:
+                    await client.aio.aclose()
+                except Exception:
+                    pass
+
+        text_parts: List[str] = []
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                text = getattr(part, "text", None)
+                if text and not getattr(part, "thought", False):
+                    text_parts.append(text)
+        result = "".join(text_parts).strip()
+        logger.debug(f"Task response: {len(result)}c")
+        return result
 
     # END GENERATED SECTION: gemini_pipe.pipe_method_groups

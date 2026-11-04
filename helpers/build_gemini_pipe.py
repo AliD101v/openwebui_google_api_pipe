@@ -36,10 +36,13 @@ STREAM_SOURCES: list[tuple[str, str]] = [
 ]
 
 METHOD_GROUP_SOURCES: list[str] = [
-    "shared/models.py",
+    "request/rag.py",
+    "request/history.py",
     "request/tools.py",
     "request/config.py",
     "response/formatting.py",
+    "shared/models.py",
+    "shared/tasks.py",
 ]
 
 METHOD_GROUP_INSERT_MARKER = "    # COMPILED PIPE METHOD GROUPS INSERTION POINT"
