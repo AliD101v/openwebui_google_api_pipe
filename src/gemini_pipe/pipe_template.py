@@ -3,6 +3,7 @@ title: Google Gemini API Manifold
 id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
+description: Google Gemini models via the native Gemini API, with optional Google Search grounding (inline citations, sources, search suggestions), thinking display, and usage stats.
 version: 0.1.0
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography

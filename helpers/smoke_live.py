@@ -62,7 +62,11 @@ def _run_scenario(pipe, scenario: str, model: str) -> bool:
         "messages": [
             {
                 "role": "user",
-                "content": "What is the capital of France? Answer in one sentence.",
+                "content": (
+                    "What were the main world news headlines today? Search the web and answer in three short bullet points."
+                    if scenario == "search"
+                    else "What is the capital of France? Answer in one sentence."
+                ),
             }
         ],
         "stream": True,
