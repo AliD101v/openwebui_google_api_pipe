@@ -108,18 +108,27 @@ class FakeClient:
     iterator reaches it). ``aio.models.generate_content(**kw)`` records ``kw``
     in ``generate_calls`` and returns the next item of ``responses`` (a
     GenerateContentResponse), or raises it when it is an Exception.
+    ``aio.files.upload(**kw)`` records ``kw`` in ``upload_calls`` and returns the
+    next item of ``files_upload`` (raising it when it is an Exception).
+    ``aio.files.get(**kw)`` does the same with ``get_calls`` / ``files_get``.
+
     ``aio.aclose`` is a no-op.
     """
 
-    def __init__(self, models=None, scripts=None, responses=None):
+    def __init__(self, models=None, scripts=None, responses=None,
+                 files_upload=None, files_get=None):
         self.models = list(models or [])
         self.scripts = list(scripts or [])
         self.responses = list(responses or [])
+        self.files_upload = list(files_upload or [])
+        self.files_get = list(files_get or [])
         self.calls = []
         self.stream_calls = []
         self.generate_calls = []
+        self.upload_calls = []
+        self.get_calls = []
         self.aio = SimpleNamespace(
-            models=self._AioModels(self), aclose=self._aclose
+            models=self._AioModels(self), files=self._AioFiles(self), aclose=self._aclose
         )
 
     @staticmethod
@@ -161,3 +170,66 @@ class FakeClient:
                 if isinstance(item, BaseException):
                     raise item
                 yield item
+
+    class _AioFiles:
+        def __init__(self, client):
+            self._client = client
+
+        async def upload(self, **kwargs):
+            self._client.upload_calls.append(kwargs)
+            if not self._client.files_upload:
+                raise AssertionError("no file left for files.upload")
+            item = self._client.files_upload.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        async def get(self, **kwargs):
+            self._client.get_calls.append(kwargs)
+            if not self._client.files_get:
+                raise AssertionError("no file left for files.get")
+            item = self._client.files_get.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+
+def fake_owui_files(mod, tmp_path, records):
+    """Patch the artifact's Files / Storage / FILES_AVAILABLE over a file store.
+
+    ``records`` is a list of dicts with keys ``id``, ``filename``, ``path``
+    (relative to ``tmp_path``), ``hash``, ``content_type`` and ``data`` (bytes,
+    written to ``tmp_path / path``). The fake Files keeps one meta dict per id,
+    so ``update_file_metadata_by_id`` merges into what the pipe reads back.
+    """
+    store = {}
+    for record in records:
+        target = tmp_path / record["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(record["data"])
+        store[record["id"]] = SimpleNamespace(
+            id=record["id"],
+            filename=record["filename"],
+            path=record["path"],
+            hash=record["hash"],
+            meta={"content_type": record["content_type"]},
+        )
+
+    class FakeFiles:
+        async def get_file_by_id(self, id):
+            return store.get(id)
+
+        async def update_file_metadata_by_id(self, id, meta):
+            record = store[id]
+            merged = dict(record.meta)
+            for key, value in (meta or {}).items():
+                merged[key] = value
+            record.meta = merged
+
+    class FakeStorage:
+        def get_file(self, path):
+            return str(tmp_path / path)
+
+    mod.FILES_AVAILABLE = True
+    mod.Files = FakeFiles()
+    mod.Storage = FakeStorage()
