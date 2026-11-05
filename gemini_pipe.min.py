@@ -35,6 +35,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import time
 import traceback
@@ -1833,6 +1834,615 @@ class Pipe:
     def _format_notice(self, text: str) -> str:
         return "\n> ⚠️ " + text + "\n"
 
+    _THOUGHT_RENDER_INTERVAL = 0.3
+
+    async def _stream_call(self, ctx, client, contents, config, call) -> None:
+        async for chunk_ in await client.aio.models.generate_content_stream(
+            model=ctx.model, contents=contents, config=config
+        ):
+            await self._handle_chunk(ctx, call, chunk_)
+
+    async def _handle_chunk(self, ctx, call, chunk_) -> None:
+        feedback = _get(chunk_, "prompt_feedback")
+        reason = _get(feedback, "block_reason") if feedback is not None else None
+        if reason:
+            await ctx.emit_text(call.index, self._format_notice(f"Prompt blocked: {reason}"))
+            call.finish_reason = "PROMPT_BLOCKED"
+            return
+
+        usage = _get(chunk_, "usage_metadata")
+        if usage:
+            call.usage = self._usage_to_dict(usage)
+
+        candidates = _get(chunk_, "candidates") or []
+        if not candidates:
+            return
+        cand = candidates[0]
+
+        call.grounding.add(_get(cand, "grounding_metadata"))
+        self._extend_url_meta(call, _get(cand, "url_context_metadata"))
+
+        finish_reason = _get(cand, "finish_reason")
+        if finish_reason:
+            call.finish_reason = finish_reason
+        finish_message = _get(cand, "finish_message")
+        if finish_message:
+            call.finish_message = finish_message
+
+        content = _get(cand, "content")
+        for part in _get(content, "parts") or []:
+            call.raw_parts.append(part)
+            await self._dispatch_part(ctx, call, part)
+
+    def _extend_url_meta(self, call, ucm) -> None:
+        for entry in _get(ucm, "url_metadata") or []:
+            url = _get(entry, "retrieved_url")
+            if not url or any(item["url"] == url for item in call.url_meta):
+                continue
+            status_value = _get(entry, "url_retrieval_status")
+            call.url_meta.append(
+                {"url": url, "status": getattr(status_value, "name", status_value) or ""}
+            )
+
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+        dump = getattr(usage, "model_dump", None)
+        data = dump(exclude_none=True) if callable(dump) else dict(usage or {})
+        return {
+            re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower(): value
+            for key, value in data.items()
+        }
+
+    async def _dispatch_part(self, ctx, call, part) -> None:
+        text = _get(part, "text")
+        thought = bool(_get(part, "thought"))
+        if thought and text:
+            await self._handle_thought_part(ctx, call, text)
+            return
+        if text:
+            await self._close_thought_run(ctx, call)
+            await ctx.status.responding()
+            await ctx.emit_text(call.index, text)
+            return
+
+        function_call = _get(part, "function_call")
+        if function_call is not None:
+            await self._close_thought_run(ctx, call)
+            call.function_calls.append(
+                {
+                    "part": part,
+                    "id": _get(function_call, "id")
+                    or f"call_{call.index}_{len(call.function_calls)}",
+                    "name": _get(function_call, "name") or "tool",
+                    "args": _get(function_call, "args") or {},
+                    "key": f"fc:{call.index}:{len(call.function_calls)}",
+                }
+            )
+            return
+
+        tool_call = _get(part, "tool_call")
+        if tool_call is not None:
+            args = _get(tool_call, "args")
+            queries = (
+                [q for q in (args.get("queries") or []) if q]
+                if isinstance(args, dict)
+                else []
+            )
+            if queries:
+                await ctx.status.searching_google(queries)
+            return
+
+        if not thought and _get(part, "inline_data") is not None:
+            logger.debug("skipping inline_data part (image output is a later milestone)")
+
+    async def _handle_thought_part(self, ctx, call, text: str) -> None:
+        if not call.thought_key:
+            call.thought_runs += 1
+            call.thought_key = f"think:{call.index}:{call.thought_runs}"
+            call.thought_started = time.monotonic()
+            call.last_thought_render = 0.0
+            await ctx.status.thinking()
+        call.thought_text += text
+        now = time.monotonic()
+        if now - call.last_thought_render < self._THOUGHT_RENDER_INTERVAL:
+            return
+        call.last_thought_render = now
+        if not getattr(ctx.user_valves, "SHOW_THOUGHTS", True):
+            return
+        block = self._format_thinking_block(call.thought_text, done=False)
+        if block:
+            await ctx.upsert_block(call.thought_key, block, call.index)
+
+    async def _close_thought_run(self, ctx, call) -> None:
+        if not call.thought_key:
+            return
+        duration = time.monotonic() - call.thought_started if call.thought_started else 0.0
+        block = self._format_thinking_block(call.thought_text, done=True, duration=duration)
+        if block:
+            await ctx.upsert_block(call.thought_key, block, call.index)
+        call.thought_key = None
+        call.thought_text = ""
+
+    async def _finalize_call(self, ctx, call) -> None:
+        await self._close_thought_run(ctx, call)
+
+        if not call.grounding.empty():
+            await self._apply_grounding(ctx, call)
+
+        if call.url_meta:
+            ok = [e["url"] for e in call.url_meta if str(e.get("status") or "").lower() == "ok"]
+            failed = len(call.url_meta) - len(ok)
+            await ctx.status.read_urls(ok, failed)
+            block = self._format_url_context_block(call.index, call.url_meta)
+            if block:
+                first_text = (ctx.msg.text_segments(call.index) or [None])[0]
+                await ctx.upsert_block(
+                    f"urlctx:{call.index}",
+                    block,
+                    call.index,
+                    before_key=first_text.key if first_text else None,
+                )
+
+        notice = self._finish_reason_notice(call.finish_reason, call.finish_message)
+        if notice:
+            await ctx.upsert_block(f"notice:{call.index}", notice, call.index)
+
+        if call.usage:
+            self._accumulate_usage(ctx.turn.usage_total, call.usage)
+
+    def _merge_replay_parts(self, parts) -> List:
+        merged: List[Any] = []
+        for part in parts or []:
+            text = _get(part, "text")
+            function_call = _get(part, "function_call")
+            tool_call = _get(part, "tool_call")
+            tool_response = _get(part, "tool_response")
+            inline_data = _get(part, "inline_data")
+            signature = _get(part, "thought_signature")
+            if not (text or function_call or tool_call or tool_response or inline_data or signature):
+                continue
+            plain = (
+                text
+                and signature is None
+                and function_call is None
+                and tool_call is None
+                and tool_response is None
+                and inline_data is None
+                and _get(part, "executable_code") is None
+                and _get(part, "code_execution_result") is None
+            )
+            thought = bool(_get(part, "thought"))
+            previous = merged[-1] if merged else None
+            if (
+                plain
+                and isinstance(previous, gtypes.Part)
+                and previous.text
+                and not getattr(previous, "thought_signature", None)
+                and bool(getattr(previous, "thought", False)) == thought
+            ):
+                merged[-1] = gtypes.Part(text=previous.text + text, thought=thought)
+                continue
+            if plain:
+                merged.append(gtypes.Part(text=text, thought=thought))
+            else:
+                merged.append(part)
+        return merged
+
+    _RETRY_BACKOFF_BASE = 2.0
+    _RETRY_BACKOFF_CAP = 30.0
+    _RESOLVED_URL_CACHE_LIMIT = 2000
+    _GROUNDING_REDIRECT_PREFIX = (
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+    )
+    _RETRYABLE_KINDS = ("rate_limit", "server", "transport")
+    _RETRY_AFTER_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*s?$")
+    _USAGE_KEYS = (
+        "prompt_token_count",
+        "cached_content_token_count",
+        "candidates_token_count",
+        "thoughts_token_count",
+        "tool_use_prompt_token_count",
+        "total_token_count",
+    )
+
+    async def _resolve_grounding_urls(self, uris: List[str]) -> Dict[str, str]:
+        resolved: Dict[str, str] = {}
+        todo: List[str] = []
+        for uri in dict.fromkeys(uris or []):
+            if not uri:
+                continue
+            cached = self._resolved_url_cache.get(uri)
+            if cached is not None:
+                resolved[uri] = cached
+            elif not uri.startswith(self._GROUNDING_REDIRECT_PREFIX):
+                continue
+            else:
+                todo.append(uri)
+        if not (todo and self.valves.RESOLVE_GROUNDING_URLS and HTTPX_AVAILABLE):
+            for uri in todo:
+                resolved[uri] = uri
+            return resolved
+
+        results: Dict[str, str] = {}
+        semaphore = asyncio.Semaphore(8)
+
+        async def _one(uri: str) -> None:
+            async with semaphore:
+                try:
+                    async with httpx.AsyncClient(follow_redirects=False) as client:
+                        response = await client.get(uri, timeout=3.0)
+                    results[uri] = response.headers.get("Location") or uri
+                except Exception:
+                    results[uri] = uri
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(_one(uri) for uri in todo)), timeout=3.0
+            )
+        except asyncio.TimeoutError:
+            logger.debug("grounding URL resolution budget exceeded; keeping redirects")
+        for uri in todo:
+            destination = results.get(uri, uri)
+            self._cache_resolved_url(uri, destination)
+            resolved[uri] = destination
+        return resolved
+
+    def _cache_resolved_url(self, uri: str, destination: str) -> None:
+        cache = self._resolved_url_cache
+        if uri in cache:
+            cache.pop(uri)
+        cache[uri] = destination
+        while len(cache) > self._RESOLVED_URL_CACHE_LIMIT:
+            cache.pop(next(iter(cache)))
+
+    async def _apply_grounding(self, ctx, call) -> None:
+        acc = call.grounding
+        queries = [q for q in acc.queries if q]
+        if queries:
+            for query in queries:
+                if query not in ctx.turn.search_queries:
+                    ctx.turn.search_queries.append(query)
+            await ctx.status.searching_google(queries)
+
+        uris = [
+            chunk_["uri"]
+            for chunk_ in acc.chunks
+            if chunk_.get("kind") == "web" and chunk_.get("uri")
+        ]
+        resolved = await self._resolve_grounding_urls(uris)
+
+        segments = ctx.msg.text_segments(call.index)
+        joined = "".join(segment.content for segment in segments)
+        cited, new_numbers, references = cite_call_text(
+            joined, acc, ctx.turn.citations, resolved
+        )
+        if segments:
+            segments[0].content = cited
+            for segment in segments[1:]:
+                segment.content = ""
+            await ctx.emit_replace()
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for number in sorted(new_numbers):
+            info = ctx.turn.citations.sources.get(number) or {}
+            url = info.get("url") or ""
+            title = info.get("title") or url
+            await ctx.emit_event(
+                {
+                    "type": "source",
+                    "data": {
+                        "source": {"name": title, "url": url, "id": str(number)},
+                        "document": references.get(number) or [title],
+                        "metadata": [
+                            {
+                                "source": f"{url}#{number}",
+                                "date_accessed": now_iso,
+                                "name": f"[{number}]",
+                            }
+                        ],
+                    },
+                }
+            )
+
+        numbers = sorted(references)
+        urls = [
+            (ctx.turn.citations.sources.get(number) or {}).get("url") or ""
+            for number in numbers
+        ]
+        if urls:
+            await ctx.status.web_search_done(urls, queries)
+
+        source_triples = []
+        for number in numbers:
+            info = ctx.turn.citations.sources.get(number) or {}
+            url = info.get("url") or ""
+            source_triples.append((number, info.get("title") or url, url))
+        embed_html = ""
+        if (
+            self.valves.SHOW_SEARCH_SUGGESTIONS == "embed"
+            and acc.entry_point_html
+        ):
+            embed_html = prepare_entry_point_embed(acc.entry_point_html)
+        block = self._format_google_search_block(
+            call.index, queries, source_triples, embed_html
+        )
+        if block:
+            first_text = (ctx.msg.text_segments(call.index) or [None])[0]
+            await ctx.upsert_block(
+                f"gsearch:{call.index}",
+                block,
+                call.index,
+                before_key=first_text.key if first_text else None,
+            )
+
+        mode = self.valves.SHOW_SEARCH_SUGGESTIONS
+        if mode == "links" or (
+            mode == "embed" and self._is_block_hidden("google_search")
+        ):
+            links = extract_suggestion_links(acc.entry_point_html, queries)
+            line = self._format_suggestion_links_line(links)
+            if line:
+                await ctx.upsert_block(f"suggest:{call.index}", line, call.index)
+
+    @classmethod
+    def _classify_error(cls, e: Exception) -> Tuple[str, Optional[float]]:
+        if genai_errors is not None and isinstance(e, genai_errors.APIError):
+            code = getattr(e, "code", None)
+            message = str(getattr(e, "message", "") or "")
+            details = getattr(e, "details", None) or {}
+            if code == 429:
+                lowered = message.lower()
+                if (
+                    "per-day" in lowered
+                    or "per day" in lowered
+                    or "daily" in lowered
+                    or "free tier" in lowered
+                    or "free-tier" in lowered
+                ):
+                    return "quota", None
+                return "rate_limit", cls._retry_after(details, message)
+            if code in (500, 502, 503, 504):
+                return "server", None
+            if code == 400:
+                return "bad_request", None
+            if code in (401, 403):
+                return "auth", None
+            if code == 404:
+                return "not_found", None
+            return "other", None
+        if isinstance(e, (asyncio.TimeoutError, OSError)):
+            return "transport", None
+        if str(type(e).__module__ or "").startswith(("httpx", "aiohttp")):
+            return "transport", None
+        return "other", None
+
+    @classmethod
+    def _retry_after(cls, details: Any, message: str = "") -> Optional[float]:
+        candidates: List[Any] = []
+        if isinstance(details, dict):
+            candidates.append(details.get("retryDelay"))
+            for value in details.values():
+                if isinstance(value, dict) and "retryDelay" in value:
+                    candidates.append(value.get("retryDelay"))
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict) and "retryDelay" in item:
+                            candidates.append(item.get("retryDelay"))
+        for raw in candidates:
+            if raw is None:
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                return min(float(raw), cls._RETRY_BACKOFF_CAP)
+            match = cls._RETRY_AFTER_RE.match(str(raw).strip())
+            if match:
+                return min(float(match.group(1)), cls._RETRY_BACKOFF_CAP)
+        return None
+
+    async def _stream_call_with_retries(
+        self, ctx, client, contents, config, call
+    ) -> None:
+        max_retries = int(getattr(self.valves, "MAX_RETRIES", 0) or 0)
+        attempt = 0
+        retried_empty = False
+        while True:
+            checkpoint = ctx.msg.checkpoint()
+            try:
+                await self._stream_call(ctx, client, contents, config, call)
+            except Exception as e:
+                kind, retry_after = self._classify_error(e)
+                if kind not in self._RETRYABLE_KINDS or attempt >= max_retries:
+                    raise
+                attempt += 1
+                await self._begin_retry(
+                    ctx, call, checkpoint, attempt, max_retries, retry_after
+                )
+                continue
+            if not self._is_empty_response(call):
+                return
+            if retried_empty or attempt >= max_retries:
+                return
+            retried_empty = True
+            attempt += 1
+            await self._begin_retry(ctx, call, checkpoint, attempt, max_retries, None)
+
+    async def _begin_retry(
+        self, ctx, call, checkpoint, attempt: int, max_retries: int,
+        retry_after: Optional[float],
+    ) -> None:
+        ctx.msg.rollback(checkpoint)
+        self._reset_call(call)
+        await ctx.emit_replace()
+        await ctx.status.activity(f"Retrying ({attempt}/{max_retries})…")
+        delay = self._retry_delay(attempt, retry_after)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _retry_delay(self, attempt: int, retry_after: Optional[float]) -> float:
+        if retry_after is not None:
+            return min(float(retry_after), self._RETRY_BACKOFF_CAP)
+        base = float(self._RETRY_BACKOFF_BASE)
+        delay = (base ** attempt) + random.uniform(0.0, 0.25 * base)
+        return min(delay, self._RETRY_BACKOFF_CAP)
+
+    def _reset_call(self, call) -> None:
+        call.raw_parts = []
+        call.function_calls = []
+        call.grounding = GroundingAccumulator()
+        call.url_meta = []
+        call.finish_reason = None
+        call.finish_message = None
+        call.usage = {}
+        call.thought_key = None
+        call.thought_text = ""
+        call.thought_started = 0.0
+        call.thought_runs = 0
+        call.last_thought_render = 0.0
+
+    @staticmethod
+    def _is_empty_response(call) -> bool:
+        if call.raw_parts or call.function_calls:
+            return False
+        return call.finish_reason in (None, "STOP", "OTHER")
+
+    async def _handle_errors(self, e: Exception, ctx) -> None:
+        kind, _retry_after = self._classify_error(e)
+        api_message = str(getattr(e, "message", "") or "").strip()
+        if kind == "auth":
+            message = "Invalid or unauthorised API key"
+        elif kind == "not_found":
+            message = "Model not found — refresh the model list"
+        elif api_message:
+            message = api_message
+        else:
+            message = str(e)
+        logger.error(f"Gemini request failed ({kind}): {e}")
+        await ctx.status.notification(message, type="error")
+        await ctx.emit_event(
+            {
+                "type": "source",
+                "data": {
+                    "source": {"name": "Gemini Error", "url": None},
+                    "document": [traceback.format_exc()],
+                    "metadata": [
+                        {
+                            "source": "gemini api",
+                            "type": "error",
+                            "date_accessed": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ],
+                },
+            }
+        )
+        await ctx.status.emit("❌ Response with Errors", done=True, force=True)
+
+    @classmethod
+    def _finish_reason_notice(cls, finish_reason, finish_message) -> Optional[str]:
+        if not finish_reason:
+            return None
+        name = getattr(finish_reason, "name", str(finish_reason))
+        if name == "MAX_TOKENS":
+            text = "Output limit reached"
+        elif name in (
+            "SAFETY",
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "BLOCKLIST",
+            "LANGUAGE",
+        ):
+            text = f"Response stopped by Google ({name})"
+        elif name in (
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_OTHER",
+            "NO_IMAGE",
+            "IMAGE_RECITATION",
+        ):
+            text = f"Image not generated ({name})"
+        elif name in (
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "MISSING_THOUGHT_SIGNATURE",
+        ):
+            text = f"Tool call failed ({name})"
+        elif name == "OTHER":
+            text = "Response ended unexpectedly"
+        else:
+            return None
+        if finish_message:
+            text += f": {finish_message}"
+        return "\n> ⚠️ " + text + "\n"
+
+    @classmethod
+    def _accumulate_usage(cls, total: dict, usage: dict) -> None:
+        usage = usage or {}
+        for key in cls._USAGE_KEYS:
+            value = usage.get(key) or 0
+            total[key] = total.get(key, 0) + value
+        total["_last_prompt"] = usage.get("prompt_token_count") or 0
+        total["_last_output"] = (usage.get("candidates_token_count") or 0) + (
+            usage.get("thoughts_token_count") or 0
+        )
+
+    @staticmethod
+    def _public_usage(turn) -> dict:
+        total = turn.usage_total or {}
+        prompt = int(total.get("_last_prompt") or 0)
+        completion = int(
+            (total.get("candidates_token_count") or 0)
+            + (total.get("thoughts_token_count") or 0)
+        )
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+            "cached_tokens": int(total.get("cached_content_token_count") or 0),
+            "reasoning_tokens": int(total.get("thoughts_token_count") or 0),
+            "tool_use_prompt_tokens": int(
+                total.get("tool_use_prompt_token_count") or 0
+            ),
+            "search_queries": len(turn.search_queries),
+            "api_calls": len(turn.calls),
+        }
+
+    @staticmethod
+    def _format_token_count(n: int) -> str:
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n / 1_000:.1f}K"
+        return str(n)
+
+    def _format_status_line(self, ctx) -> str:
+        line = "✅ Response Complete"
+        setting = getattr(ctx.user_valves, "SHOW_TOKEN_COUNT", "Off")
+        if not setting or setting == "Off":
+            return line
+        total = ctx.turn.usage_total or {}
+        context_used = int(total.get("_last_prompt") or 0) + int(
+            total.get("_last_output") or 0
+        )
+        context_window = int(ctx.info.get("context_length") or 200_000)
+        if context_window <= 0:
+            context_window = 200_000
+        percentage = min((context_used / context_window) * 100, 100.0)
+        filled = int(percentage / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        line += (
+            f" [{bar}] {self._format_token_count(context_used)}/"
+            f"{self._format_token_count(context_window)} ({percentage:.1f}%)"
+        )
+        calls = len(ctx.turn.calls)
+        if calls > 1:
+            line += f" · {calls} calls"
+        if setting == "With Cache":
+            prompt = int(total.get("_last_prompt") or 0)
+            cached = int(total.get("cached_content_token_count") or 0)
+            if prompt > 0:
+                line += f" | ⚡ {cached * 100 // prompt}% cached"
+        return line
+
     _CHAT_MODEL_REJECT_TOKENS = (
         "embedding",
         "aqa",
@@ -2390,3 +3000,198 @@ class Pipe:
         result = "".join(text_parts).strip()
         logger.debug(f"Task response: {len(result)}c")
         return result
+
+    async def pipe(
+        self,
+        body,
+        __user__=None,
+        __event_emitter__=None,
+        __metadata__=None,
+        __tools__=None,
+        __files__=None,
+        __task__=None,
+        __task_body__=None,
+        __request__=None,
+        __event_call__=None,
+    ) -> str:
+        user = __user__ or {}
+        user_valves = self._user_valves_from(user)
+
+        HIDDEN_BLOCKS.set(self._parse_hidden_blocks(getattr(user_valves, "HIDE_BLOCKS", None)))
+        TOOL_APPROVAL.set(
+            (
+                ((__metadata__ or {}).get("params") or {}).get("tool_approval_mode", "full"),
+                __event_call__,
+            )
+        )
+        SLIM_OUTPUT.set(
+            bool(
+                __request__ is not None
+                and getattr(getattr(__request__, "state", None), "internal", False) is True
+            )
+        )
+
+        api_key = self._resolve_api_key(user_valves)
+        if not str(api_key or "").strip():
+            logger.error("no Gemini API key configured")
+            if __event_emitter__ is not None:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "notification",
+                            "data": {
+                                "type": "error",
+                                "content": "No Gemini API key configured. Set it in the "
+                                "pipe valves or your personal user valves.",
+                            },
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"event emitter failed: {e}")
+            return "Error: no Gemini API key configured."
+
+        if __task__:
+            return await self._run_task(body, __task__, __user__, user_valves)
+
+        if __metadata__ is not None:
+            __metadata__.setdefault("params", {})["reasoning_tags"] = False
+
+        if inspect.isawaitable(__tools__):
+            __tools__ = await __tools__
+
+        model = self._model_name_from_body(body)
+        info = self.get_model_info(model)
+        ctx = new_request_context(
+            self,
+            event_emitter=__event_emitter__,
+            model=model,
+            info=info,
+            user=user,
+            user_valves=user_valves,
+            metadata=__metadata__ or {},
+            request={},
+            api_key=api_key,
+            tools=dict(__tools__ or {}),
+            builtin_tools={},
+            rag_offset=_rag_citation_offset((__metadata__ or {}).get("sources") or []),
+        )
+
+        client = None
+        try:
+            system_instruction, contents = await self._convert_history(
+                (body or {}).get("messages") or [], info, ctx
+            )
+            flags = self._resolve_builtin_flags(
+                ctx.metadata, self.valves, user_valves, info, self._last_user_text(body)
+            )
+            decls: List = []
+            tools, tool_config, notes = self._assemble_tools(info, flags, decls)
+            for note in notes:
+                await ctx.status.activity(note)
+            thinking = self._build_thinking_config(info, user_valves, body)
+            config = self._build_generate_config(
+                info=info,
+                system_instruction=system_instruction,
+                tools=tools,
+                tool_config=tool_config,
+                thinking=thinking,
+                body=body,
+                user_valves=user_valves,
+            )
+            client = self._build_genai_client(api_key, timeout_s=self.valves.REQUEST_TIMEOUT)
+            await ctx.status.waiting()
+            await self._run_generation_loop(ctx, contents, config, client)
+            return await self._finalise(ctx, __metadata__)
+        except asyncio.CancelledError:
+            try:
+                await ctx.status.emit(
+                    "⏹️ Request Cancelled", done=True, hidden=False, force=True
+                )
+                partial = ctx.text()
+                if partial:
+                    await ctx.emit_event(
+                        {"type": "replace", "data": {"content": partial}}
+                    )
+                await self._emit_completion(ctx)
+            except Exception as e:
+                logger.debug(f"Cancel cleanup emit failed: {e}")
+            raise
+        except Exception as e:
+            await self._handle_errors(e, ctx)
+            return ctx.text()
+        finally:
+            await self._close_client(client)
+
+    def _user_valves_from(self, user: dict) -> "Pipe.UserValves":
+        raw = (user or {}).get("valves")
+        if isinstance(raw, self.UserValves):
+            return raw
+        if not raw:
+            return self.UserValves()
+        fields = {k: v for k, v in dict(raw).items() if k in self.UserValves.model_fields}
+        return self.UserValves(**fields)
+
+    def _last_user_text(self, body: dict) -> str:
+        for message in reversed((body or {}).get("messages") or []):
+            if isinstance(message, dict) and message.get("role") == "user":
+                return self._block_text(message.get("content"))
+        return ""
+
+    async def _run_generation_loop(self, ctx, contents, config, client) -> None:
+        max_calls = max(int(getattr(self.valves, "MAX_TOOL_CALLS", 1) or 1), 1) + 1
+        for call_index in range(max_calls):
+            call = CallState(index=call_index)
+            ctx.turn.calls.append(call)
+            await self._stream_call_with_retries(ctx, client, contents, config, call)
+            await self._finalize_call(ctx, call)
+            replay = self._merge_replay_parts(call.raw_parts)
+            if replay:
+                contents.append(gtypes.Content(role="model", parts=replay))
+            if not call.function_calls:
+                return
+            await ctx.upsert_block(
+                f"toolstop:{call.index}",
+                self._format_notice(
+                    "Tool calls are not supported in this milestone; stopping here"
+                ),
+                call.index,
+            )
+            return
+
+    async def _finalise(self, ctx, metadata: Optional[dict]) -> str:
+        text = ctx.text()
+        if text:
+            await ctx.emit_event({"type": "replace", "data": {"content": text}})
+        await ctx.status.complete(self._format_status_line(ctx))
+        await self._emit_completion(ctx)
+        if CHATS_AVAILABLE and metadata and ctx.turn.usage_total:
+            chat_id = metadata.get("chat_id")
+            message_id = metadata.get("message_id")
+            if chat_id and message_id and not str(chat_id).startswith("local:"):
+                try:
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, message_id, {"usage": self._public_usage(ctx.turn)}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to persist usage to chat_message: {e}")
+        return text
+
+    async def _emit_completion(self, ctx) -> None:
+        data: dict = {
+            "choices": [{"finish_reason": "stop", "delta": {"content": ""}}],
+            "done": True,
+        }
+        if ctx.turn.usage_total:
+            data["usage"] = self._public_usage(ctx.turn)
+        await ctx.emit_event({"type": "chat:completion", "data": data})
+
+    @staticmethod
+    async def _close_client(client) -> None:
+        if client is None:
+            return
+        try:
+            aclose = getattr(getattr(client, "aio", None), "aclose", None)
+            if callable(aclose):
+                await aclose()
+        except BaseException as e:
+            logger.debug(f"client close failed: {e}")

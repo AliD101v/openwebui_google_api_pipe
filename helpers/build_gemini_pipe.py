@@ -41,8 +41,11 @@ METHOD_GROUP_SOURCES: list[str] = [
     "request/tools.py",
     "request/config.py",
     "response/formatting.py",
+    "response/stream_parts.py",
+    "response/runtime.py",
     "shared/models.py",
     "shared/tasks.py",
+    "pipe_orchestrator.py",
 ]
 
 METHOD_GROUP_INSERT_MARKER = "    # COMPILED PIPE METHOD GROUPS INSERTION POINT"
