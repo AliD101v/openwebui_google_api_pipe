@@ -5,6 +5,7 @@ status line.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -419,17 +420,17 @@ class _Runtime:
         )
 
     @staticmethod
-    def _public_usage(turn) -> dict:
+    def _public_usage(turn, cost: Optional[float] = None) -> dict:
         """Project the turn's usage onto OpenWebUI's usage schema: the prompt
         gauge is the LAST call's prompt, completion is candidates+thoughts
-        summed over all calls."""
+        summed over all calls. ``cost`` is the estimated USD when known."""
         total = turn.usage_total or {}
         prompt = int(total.get("_last_prompt") or 0)
         completion = int(
             (total.get("candidates_token_count") or 0)
             + (total.get("thoughts_token_count") or 0)
         )
-        return {
+        usage = {
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": prompt + completion,
@@ -441,6 +442,9 @@ class _Runtime:
             "search_queries": len(turn.search_queries),
             "api_calls": len(turn.calls),
         }
+        if cost is not None:
+            usage["cost_usd"] = cost
+        return usage
 
     @staticmethod
     def _format_token_count(n: int) -> str:
@@ -451,32 +455,92 @@ class _Runtime:
         return str(n)
 
     def _format_status_line(self, ctx) -> str:
-        """The final status line: completion plus the context gauge when the
-        user asks for token counts."""
+        """The final status line: completion, the context gauge when the user
+        asks for token counts, and the cost estimate when SHOW_COST is on
+        (independent of the token count)."""
         line = "✅ Response Complete"
         setting = getattr(ctx.user_valves, "SHOW_TOKEN_COUNT", "Off")
-        if not setting or setting == "Off":
-            return line
-        total = ctx.turn.usage_total or {}
-        context_used = int(total.get("_last_prompt") or 0) + int(
-            total.get("_last_output") or 0
-        )
-        context_window = int(ctx.info.get("context_length") or 200_000)
-        if context_window <= 0:
-            context_window = 200_000
-        percentage = min((context_used / context_window) * 100, 100.0)
-        filled = int(percentage / 10)
-        bar = "█" * filled + "░" * (10 - filled)
-        line += (
-            f" [{bar}] {self._format_token_count(context_used)}/"
-            f"{self._format_token_count(context_window)} ({percentage:.1f}%)"
-        )
-        calls = len(ctx.turn.calls)
-        if calls > 1:
-            line += f" · {calls} calls"
-        if setting == "With Cache":
-            prompt = int(total.get("_last_prompt") or 0)
-            cached = int(total.get("cached_content_token_count") or 0)
-            if prompt > 0:
-                line += f" | ⚡ {cached * 100 // prompt}% cached"
+        if setting and setting != "Off":
+            total = ctx.turn.usage_total or {}
+            context_used = int(total.get("_last_prompt") or 0) + int(
+                total.get("_last_output") or 0
+            )
+            context_window = int(ctx.info.get("context_length") or 200_000)
+            if context_window <= 0:
+                context_window = 200_000
+            percentage = min((context_used / context_window) * 100, 100.0)
+            filled = int(percentage / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            line += (
+                f" [{bar}] {self._format_token_count(context_used)}/"
+                f"{self._format_token_count(context_window)} ({percentage:.1f}%)"
+            )
+            calls = len(ctx.turn.calls)
+            if calls > 1:
+                line += f" · {calls} calls"
+            if setting == "With Cache":
+                prompt = int(total.get("_last_prompt") or 0)
+                cached = int(total.get("cached_content_token_count") or 0)
+                if prompt > 0:
+                    line += f" | ⚡ {cached * 100 // prompt}% cached"
+        if getattr(ctx.user_valves, "SHOW_COST", True):
+            cost = self._turn_cost(ctx)
+            if cost is not None:
+                line += f" | 💵 ≈{format_usd(cost)}"
         return line
+
+    def _model_pricing_overrides(self) -> dict:
+        """The MODEL_PRICING_OVERRIDES valve parsed; invalid JSON is ignored."""
+        raw = (self.valves.MODEL_PRICING_OVERRIDES or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"MODEL_PRICING_OVERRIDES is not valid JSON; ignored: {e}")
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning("MODEL_PRICING_OVERRIDES must be a JSON object; ignored")
+            return {}
+        return {
+            str(pattern): values
+            for pattern, values in parsed.items()
+            if isinstance(values, dict)
+        }
+
+    def _turn_cost(self, ctx) -> Optional[float]:
+        """The estimated USD cost of the whole turn (all API calls plus search
+        and Maps grounding), or None when the model's rates are unknown."""
+        rates = GEMINI_PRICING.rates_for(
+            ctx.model,
+            datetime.now(timezone.utc).date(),
+            self._model_pricing_overrides(),
+        )
+        if rates is None:
+            return None
+        total = 0.0
+        for call in ctx.turn.calls:
+            total += GEMINI_PRICING.call_cost(rates, call.usage)
+        generation = ctx.info.get("generation")
+        if generation is None:
+            generation = 3.0
+        key = "gen3" if float(generation) >= 3 else "gen25"
+        if key == "gen3":
+            # Gemini 3+ bills per search query actually issued.
+            search_count = len(ctx.turn.search_queries)
+        else:
+            # Gemini 2.5 bills per grounded prompt, i.e. per call that
+            # returned web chunks.
+            search_count = sum(
+                1
+                for call in ctx.turn.calls
+                if any(c.get("kind") == "web" for c in call.grounding.chunks)
+            )
+        maps_count = sum(
+            1
+            for call in ctx.turn.calls
+            if any(c.get("kind") == "maps" for c in call.grounding.chunks)
+        )
+        total += search_count * SEARCH_PRICE_PER_1K[key] / 1000
+        total += maps_count * MAPS_PRICE_PER_1K[key] / 1000
+        return total

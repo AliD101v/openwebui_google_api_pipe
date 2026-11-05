@@ -348,8 +348,12 @@ class _Orchestrator:
             message_id = metadata.get("message_id")
             if chat_id and message_id and not str(chat_id).startswith("local:"):
                 try:
+                    cost = self._turn_cost(ctx) if getattr(
+                        ctx.user_valves, "SHOW_COST", True
+                    ) else None
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        chat_id, message_id, {"usage": self._public_usage(ctx.turn)}
+                        chat_id, message_id,
+                        {"usage": self._public_usage(ctx.turn, cost)},
                     )
                 except Exception as e:
                     logger.warning(f"Failed to persist usage to chat_message: {e}")
@@ -361,7 +365,10 @@ class _Orchestrator:
             "done": True,
         }
         if ctx.turn.usage_total:
-            data["usage"] = self._public_usage(ctx.turn)
+            cost = self._turn_cost(ctx) if getattr(
+                ctx.user_valves, "SHOW_COST", True
+            ) else None
+            data["usage"] = self._public_usage(ctx.turn, cost)
         await ctx.emit_event({"type": "chat:completion", "data": data})
 
     @staticmethod

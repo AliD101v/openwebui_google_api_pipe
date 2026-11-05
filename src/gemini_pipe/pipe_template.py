@@ -492,6 +492,9 @@ def new_request_context(
 # BEGIN GENERATED SECTION: gemini_pipe.response.status_events
 # END GENERATED SECTION: gemini_pipe.response.status_events
 
+# BEGIN GENERATED SECTION: gemini_pipe.shared.pricing
+# END GENERATED SECTION: gemini_pipe.shared.pricing
+
 
 class Pipe:
     """OpenWebUI manifold pipe for the Gemini Developer API."""

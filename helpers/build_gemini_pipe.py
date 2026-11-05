@@ -33,6 +33,7 @@ STREAM_SOURCES: list[tuple[str, str]] = [
     ("response.grounding", "response/grounding.py"),
     ("response.state", "response/state.py"),
     ("response.status_events", "response/status_events.py"),
+    ("shared.pricing", "shared/pricing.py"),
 ]
 
 METHOD_GROUP_SOURCES: list[str] = [
