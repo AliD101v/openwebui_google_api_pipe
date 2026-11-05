@@ -44,13 +44,17 @@ class _History:
     _NOTICE_LINE_PREFIX = "> ⚠️"
 
     async def _convert_history(
-        self, messages, info, ctx
+        self, messages, info, ctx, extra_parts_by_user_idx: Optional[dict] = None
     ) -> Tuple[Optional[str], List[gtypes.Content]]:
         """The system instruction and the Gemini Contents for one request.
 
         Memories are extracted out of the system prompt and appended to the
         last user message instead: they are re-ranked per request, so they
         must not churn the (cacheable) system prefix.
+
+        ``extra_parts_by_user_idx`` maps the 0-based user-message index to
+        parts (native media) that are prepended to that message's parts,
+        before its text.
         """
         messages = messages or []
         last_user_index = -1
@@ -75,12 +79,17 @@ class _History:
                 system_instruction = None
 
         contents: List[gtypes.Content] = []
+        user_index = -1
         for i, message in enumerate(messages):
             if not isinstance(message, dict):
                 continue
             role = message.get("role")
             if role == "user":
+                user_index += 1
                 parts = await self._user_parts(message.get("content", ""), ctx)
+                extra = (extra_parts_by_user_idx or {}).get(user_index)
+                if extra:
+                    parts = list(extra) + parts
                 if memories is not None and i == last_user_index:
                     parts = self._append_memories(parts, memories)
                 if parts:

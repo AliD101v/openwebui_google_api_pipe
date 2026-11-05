@@ -73,6 +73,103 @@ class _Rag:
         encoded_value = quote(value, safe="")
         return f" [](gemini:{messagenum}:{id}:{encoded_value}) "
 
+    def _remove_sources_from_rag(self, rag_content: str, filenames_to_remove: List[str]) -> str:
+        """Remove the <source> tags whose name attribute matches one of the
+        filenames from a RAG template.
+
+        Returns the modified template, or "" when every source was removed
+        (an empty <context></context> or no sources at all are left): the
+        caller then drops the whole RAG block.
+        """
+        if not filenames_to_remove:
+            return rag_content
+
+        modified = rag_content
+        for filename in filenames_to_remove:
+            pattern = re.compile(
+                rf'<source[^>]*name="{re.escape(filename)}"[^>]*>.*?</source>\s*',
+                re.DOTALL,
+            )
+            modified = pattern.sub("", modified)
+
+        if PATTERN_EMPTY_CONTEXT.search(modified) or not PATTERN_SOURCE_TAGS.search(modified):
+            logger.debug("RAG: all sources removed, clearing entire RAG message")
+            return ""
+
+        logger.debug(
+            f"RAG: removed {len(filenames_to_remove)} source(s) from RAG content"
+        )
+        return modified
+
+    def _remove_specific_sources_from_rag_message(
+        self, processed_messages: List[dict], filenames_to_remove: List[str]
+    ) -> None:
+        """Remove the sources named in ``filenames_to_remove`` from the RAG
+        template of the latest message (system or user) that carries one.
+
+        Files sent natively to Gemini must not also arrive as RAG text. Other
+        sources are kept; when all sources match, the whole RAG template goes.
+        The messages are modified in place.
+        """
+        if not filenames_to_remove:
+            return
+
+        for i in range(len(processed_messages) - 1, -1, -1):
+            msg = processed_messages[i]
+            if not isinstance(msg, dict) or msg.get("role") not in ("system", "user"):
+                continue
+
+            content = msg.get("content")
+            if isinstance(content, str):
+                match = PATTERN_RAG_MESSAGE.search(content)
+                if not match:
+                    continue
+                modified_rag = self._remove_sources_from_rag(
+                    match.group(0), filenames_to_remove
+                )
+                start, end = match.span()
+                if not modified_rag:
+                    new_text = content[:start] + content[end:]
+                else:
+                    new_text = content[:start] + modified_rag + content[end:]
+                msg["content"] = new_text.strip()
+                return
+
+            if not isinstance(content, list):
+                continue
+
+            modified = False
+            new_content: List[dict] = []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    new_content.append(block)
+                    continue
+
+                text = block.get("text", "")
+                match = PATTERN_RAG_MESSAGE.search(text)
+                if not match:
+                    new_content.append(block)
+                    continue
+
+                modified_rag = self._remove_sources_from_rag(
+                    match.group(0), filenames_to_remove
+                )
+                start, end = match.span()
+                if not modified_rag:
+                    new_text = text[:start] + text[end:]
+                else:
+                    new_text = text[:start] + modified_rag + text[end:]
+                new_text = new_text.strip()
+                if new_text:
+                    new_block = dict(block)
+                    new_block["text"] = new_text
+                    new_content.append(new_block)
+                modified = True
+
+            if modified:
+                msg["content"] = new_content
+                return
+
     def _extract_metadata_marker_from_message(self, message) -> List[str]:
         """Extract the metadata payloads from the last assistant message and
         remove the markers from it in place."""

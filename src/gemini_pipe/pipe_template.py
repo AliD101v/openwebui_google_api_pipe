@@ -44,7 +44,7 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
-from urllib.parse import urlparse, quote, quote_plus
+from urllib.parse import urlparse, quote, quote_plus, unquote
 from pydantic import BaseModel, Field, field_validator
 
 # =============================================================================

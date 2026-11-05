@@ -38,6 +38,7 @@ STREAM_SOURCES: list[tuple[str, str]] = [
 METHOD_GROUP_SOURCES: list[str] = [
     "request/rag.py",
     "request/history.py",
+    "request/media.py",
     "request/tools.py",
     "request/config.py",
     "response/formatting.py",

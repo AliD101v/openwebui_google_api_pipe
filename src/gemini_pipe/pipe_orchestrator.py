@@ -90,8 +90,14 @@ class _Orchestrator:
 
         client = None
         try:
+            client = self._build_genai_client(api_key, timeout_s=self.valves.REQUEST_TIMEOUT)
+            messages = (body or {}).get("messages") or []
+            prior = self._collect_prior_marker_entries(messages)
+            media = await self._collect_native_media(ctx, client, messages, __files__, prior)
+            cleaned = copy.deepcopy(messages)
+            self._remove_specific_sources_from_rag_message(cleaned, media["native_names"])
             system_instruction, contents = await self._convert_history(
-                (body or {}).get("messages") or [], info, ctx
+                cleaned, info, ctx, extra_parts_by_user_idx=media["parts"]
             )
             flags = self._resolve_builtin_flags(
                 ctx.metadata, self.valves, user_valves, info, self._last_user_text(body)
@@ -110,9 +116,9 @@ class _Orchestrator:
                 body=body,
                 user_valves=user_valves,
             )
-            client = self._build_genai_client(api_key, timeout_s=self.valves.REQUEST_TIMEOUT)
             await ctx.status.waiting()
             await self._run_generation_loop(ctx, contents, config, client)
+            await self._persist_media_markers(ctx, media, prior)
             return await self._finalise(ctx, __metadata__)
         except asyncio.CancelledError:
             try:
@@ -150,6 +156,50 @@ class _Orchestrator:
             if isinstance(message, dict) and message.get("role") == "user":
                 return self._block_text(message.get("content"))
         return ""
+
+    def _collect_prior_marker_entries(self, messages: List[dict]) -> List[str]:
+        """The union, in order and deduplicated, of the metadata marker entries
+        of every assistant message in the stored conversation.
+
+        Extracted on copies, because the extraction removes the markers from
+        the message in place and the caller still needs the originals.
+        """
+        entries: List[str] = []
+        seen = set()
+        for message in messages or []:
+            for entry in self._extract_metadata_marker_from_message(copy.deepcopy(message)):
+                if entry not in seen:
+                    seen.add(entry)
+                    entries.append(entry)
+        return entries
+
+    async def _persist_media_markers(self, ctx, media: dict, prior: List[str]) -> None:
+        """Append this turn's media markers, plus every prior marker of
+        another kind, as the last block of the message.
+
+        The block lands in the saved message, so the next turn re-anchors the
+        files at their original messages instead of the latest one.
+        """
+        entries = list((media or {}).get("entries") or [])
+        seen = set(entries)
+        for entry in prior or []:
+            if entry not in seen:
+                seen.add(entry)
+                entries.append(entry)
+        markers = []
+        for entry in entries:
+            parts = str(entry).split(":", 2)
+            if len(parts) < 3:
+                continue
+            try:
+                msgnum = int(parts[0])
+            except ValueError:
+                continue
+            markers.append(self._create_metadata_marker(parts[1], unquote(parts[2]), msgnum))
+        if not markers:
+            return
+        call = ctx.turn.calls[-1].index if ctx.turn.calls else 0
+        await ctx.upsert_block("markers", "".join(markers), call)
 
     async def _run_generation_loop(self, ctx, contents, config, client) -> None:
         """The call loop: stream, finalise, replay. Function tools arrive in a
