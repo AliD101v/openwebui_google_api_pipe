@@ -273,7 +273,7 @@ class _Runtime:
     ) -> None:
         """Roll the message back, reset the call, and wait out the backoff."""
         ctx.msg.rollback(checkpoint)
-        self._reset_call(call)
+        self._reset_call(call, ctx)
         await ctx.emit_replace()
         await ctx.status.activity(f"Retrying ({attempt}/{max_retries})…")
         delay = self._retry_delay(attempt, retry_after)
@@ -287,7 +287,16 @@ class _Runtime:
         delay = (base ** attempt) + random.uniform(0.0, 0.25 * base)
         return min(delay, self._RETRY_BACKOFF_CAP)
 
-    def _reset_call(self, call) -> None:
+    def _reset_call(self, call, ctx=None) -> None:
+        started = 0
+        for fc in call.function_calls:
+            task = fc.get("task") if isinstance(fc, dict) else None
+            if task is not None:
+                started += 1
+                if not task.done():
+                    task.cancel()
+        if ctx is not None and started:
+            ctx.turn.tool_calls_made = max(0, ctx.turn.tool_calls_made - started)
         call.raw_parts = []
         call.function_calls = []
         call.grounding = GroundingAccumulator()

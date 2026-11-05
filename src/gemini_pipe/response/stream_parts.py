@@ -99,6 +99,7 @@ class _StreamParts:
             call.function_calls.append(
                 {
                     "part": part,
+                    "raw_id": _get(function_call, "id"),
                     "id": _get(function_call, "id")
                     or f"call_{call.index}_{len(call.function_calls)}",
                     "name": _get(function_call, "name") or "tool",
@@ -106,6 +107,7 @@ class _StreamParts:
                     "key": f"fc:{call.index}:{len(call.function_calls)}",
                 }
             )
+            await self._start_function_call(ctx, call, call.function_calls[-1])
             return
 
         tool_call = _get(part, "tool_call")

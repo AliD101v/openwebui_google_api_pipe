@@ -81,10 +81,12 @@ class _Orchestrator:
             user=user,
             user_valves=user_valves,
             metadata=__metadata__ or {},
-            request={},
+            request=__request__,
             api_key=api_key,
             tools=dict(__tools__ or {}),
-            builtin_tools={},
+            builtin_tools=await self._gather_builtin_tools(
+                __request__, user, __event_emitter__, __metadata__, __tools__
+            ),
             rag_offset=_rag_citation_offset((__metadata__ or {}).get("sources") or []),
         )
 
@@ -102,7 +104,7 @@ class _Orchestrator:
             flags = self._resolve_builtin_flags(
                 ctx.metadata, self.valves, user_valves, info, self._last_user_text(body)
             )
-            decls: List = []
+            decls = self._build_function_declarations(ctx)
             tools, tool_config, notes = self._assemble_tools(info, flags, decls)
             for note in notes:
                 await ctx.status.activity(note)
@@ -202,27 +204,136 @@ class _Orchestrator:
         await ctx.upsert_block("markers", "".join(markers), call)
 
     async def _run_generation_loop(self, ctx, contents, config, client) -> None:
-        """The call loop: stream, finalise, replay. Function tools arrive in a
-        later milestone; one arriving now renders a notice and stops."""
-        max_calls = max(int(getattr(self.valves, "MAX_TOOL_CALLS", 1) or 1), 1) + 1
-        for call_index in range(max_calls):
-            call = CallState(index=call_index)
+        """The call loop: stream, finalise, replay. Function calls are executed
+        by the pipe and their responses replayed until the model answers; a
+        rejected call (malformed function call, missing thought signature)
+        rolls the call back and retries it once."""
+        max_tool_calls = max(int(getattr(self.valves, "MAX_TOOL_CALLS", 1) or 1), 1)
+        retried: set = set()
+        for _iteration in range(max_tool_calls + 3):
+            call = CallState(index=len(ctx.turn.calls))
             ctx.turn.calls.append(call)
+            checkpoint = ctx.msg.checkpoint()
             await self._stream_call_with_retries(ctx, client, contents, config, call)
             await self._finalize_call(ctx, call)
+            finish_name = (
+                getattr(call.finish_reason, "name", str(call.finish_reason))
+                if call.finish_reason is not None
+                else ""
+            )
+            if (
+                finish_name
+                in ("MALFORMED_FUNCTION_CALL", "MISSING_THOUGHT_SIGNATURE")
+                and finish_name not in retried
+            ):
+                # Roll the call back (its rendered output, any started tool
+                # tasks) and retry it once.
+                self._reset_call(call, ctx)
+                ctx.msg.rollback(checkpoint)
+                await ctx.emit_replace()
+                if finish_name == "MISSING_THOUGHT_SIGNATURE":
+                    self._restore_missing_signatures(contents)
+                retried.add(finish_name)
+                continue
+            if not call.function_calls:
+                return
             replay = self._merge_replay_parts(call.raw_parts)
             if replay:
                 contents.append(gtypes.Content(role="model", parts=replay))
-            if not call.function_calls:
-                return
-            await ctx.upsert_block(
-                f"toolstop:{call.index}",
-                self._format_notice(
-                    "Tool calls are not supported in this milestone; stopping here"
-                ),
-                call.index,
+            contents.append(await self._finish_function_calls(ctx, call))
+            if ctx.turn.tool_calls_made >= max_tool_calls:
+                config = self._disable_function_calling(config)
+
+    async def _gather_builtin_tools(
+        self, __request__, user, __event_emitter__, __metadata__, __tools__
+    ) -> dict:
+        """The executable tools beyond ``__tools__``: OpenWebUI's built-in
+        tools (memory, …) plus the external tool-server tools the metadata
+        hands over with their callables."""
+        builtin_tools: dict = {}
+        if BUILTIN_TOOLS_AVAILABLE and __request__ is not None:
+            try:
+                memory_enabled = (
+                    user.get("settings", {}).get("ui", {}).get("memory", False)
+                    if user
+                    else False
+                )
+                builtin_tools = get_builtin_tools(
+                    __request__,
+                    {
+                        "__user__": user,
+                        "__event_emitter__": __event_emitter__,
+                        "__chat_id__": (__metadata__ or {}).get("chat_id"),
+                        "__message_id__": (__metadata__ or {}).get("message_id"),
+                    },
+                    features={"memory": memory_enabled},
+                    model={"info": {"meta": {"builtinTools": {"skills": False}}}},
+                )
+                if inspect.isawaitable(builtin_tools):
+                    builtin_tools = await builtin_tools
+                logger.debug(
+                    f"Loaded {len(builtin_tools)} builtin tools: "
+                    f"{list(builtin_tools.keys())}"
+                )
+            except Exception as e:
+                logger.warning(f"Could not load builtin tools: {e}")
+                builtin_tools = {}
+        metadata_tools = (__metadata__ or {}).get("tools", {})
+        if metadata_tools:
+            for t_name, t_data in metadata_tools.items():
+                if t_name in builtin_tools:
+                    continue
+                if __tools__ and t_name in __tools__:
+                    continue
+                if isinstance(t_data, dict) and t_data.get("callable"):
+                    builtin_tools[t_name] = t_data
+        if builtin_tools:
+            logger.debug(f"Executable tool set: {list(builtin_tools.keys())}")
+        return builtin_tools
+
+    def _restore_missing_signatures(self, contents: List[gtypes.Content]) -> None:
+        """After a MISSING_THOUGHT_SIGNATURE rejection: give the first
+        unsigned function_call part of every signed-context model content the
+        dummy signature so the retry passes Gemini 3+'s validator."""
+        last_user = -1
+        for index, content in enumerate(contents):
+            if content.role == "user":
+                last_user = index
+        for content in contents[last_user + 1 :]:
+            if content.role != "model":
+                continue
+            if not any(getattr(p, "text", None) for p in content.parts):
+                continue
+            for index, part in enumerate(content.parts):
+                if (
+                    getattr(part, "function_call", None) is not None
+                    and getattr(part, "thought_signature", None) is None
+                ):
+                    content.parts[index] = part.model_copy(
+                        update={"thought_signature": DUMMY_THOUGHT_SIGNATURE}
+                    )
+                    break
+
+    @staticmethod
+    def _disable_function_calling(config) -> gtypes.GenerateContentConfig:
+        """A copy of ``config`` with function calling switched off (the tool
+        call limit is reached); the tools themselves stay declared."""
+        config = config.model_copy(deep=True)
+        tool_config = config.tool_config
+        if tool_config is None:
+            tool_config = gtypes.ToolConfig(
+                function_calling_config=gtypes.FunctionCallingConfig(mode="NONE")
             )
-            return
+        else:
+            tool_config = tool_config.model_copy(
+                update={
+                    "function_calling_config": gtypes.FunctionCallingConfig(
+                        mode="NONE"
+                    )
+                }
+            )
+        config.tool_config = tool_config
+        return config
 
     async def _finalise(self, ctx, metadata: Optional[dict]) -> str:
         """The successful end of a turn: final replace, closing status, the

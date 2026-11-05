@@ -413,7 +413,7 @@ class PipeRequestContext:
     user: dict
     user_valves: "Pipe.UserValves"
     metadata: dict
-    request: dict
+    request: Any
     model: str
     info: dict
     api_key: str
@@ -477,7 +477,7 @@ def new_request_context(
         user=dict(user or {}),
         user_valves=pipe.UserValves() if user_valves is None else user_valves,
         metadata=dict(metadata or {}),
-        request=dict(request or {}),
+        request=request if request is not None else {},
         model=model,
         info=dict(info or {}),
         api_key=api_key,

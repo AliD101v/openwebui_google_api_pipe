@@ -125,3 +125,4 @@ class TurnState:
     tool_calls_made: int = 0
     degraded: set = field(default_factory=set)
     name_map: Dict[str, str] = field(default_factory=dict)
+    functions_offered: bool = False

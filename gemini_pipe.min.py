@@ -679,6 +679,7 @@ class TurnState:
     tool_calls_made: int = 0
     degraded: set = field(default_factory=set)
     name_map: Dict[str, str] = field(default_factory=dict)
+    functions_offered: bool = False
 
 @dataclass
 class PipeRequestContext:
@@ -692,7 +693,7 @@ class PipeRequestContext:
     user: dict
     user_valves: "Pipe.UserValves"
     metadata: dict
-    request: dict
+    request: Any
     model: str
     info: dict
     api_key: str
@@ -749,7 +750,7 @@ def new_request_context(
         user=dict(user or {}),
         user_valves=pipe.UserValves() if user_valves is None else user_valves,
         metadata=dict(metadata or {}),
-        request=dict(request or {}),
+        request=request if request is not None else {},
         model=model,
         info=dict(info or {}),
         api_key=api_key,
@@ -1930,6 +1931,50 @@ class Pipe:
 
         return tools, tool_config, notes
 
+    @staticmethod
+    def _sanitize_function_name(name: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(name or ""))
+        if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
+            cleaned = "_" + cleaned
+        return cleaned[:64]
+
+    def _build_function_declarations(self, ctx) -> list:
+        decls: List[gtypes.FunctionDeclaration] = []
+        offered_originals: set = set()
+        taken: set = set()
+        for source in (ctx.tools or {}, ctx.builtin_tools or {}):
+            for original, entry in source.items():
+                original = str(original)
+                if original in offered_originals:
+                    continue
+                if original.startswith("_"):
+                    continue
+                if not isinstance(entry, dict) or not entry.get("callable"):
+                    continue
+                offered_originals.add(original)
+                spec = entry.get("spec")
+                spec = spec if isinstance(spec, dict) else {}
+                candidate = self._sanitize_function_name(original)
+                suffix = 2
+                while candidate in taken:
+                    candidate = f"{self._sanitize_function_name(original)}_{suffix}"
+                    suffix += 1
+                taken.add(candidate)
+                ctx.turn.name_map[candidate] = original
+                parameters = spec.get("parameters")
+                if not isinstance(parameters, dict):
+                    parameters = {"type": "object", "properties": {}}
+                decls.append(
+                    gtypes.FunctionDeclaration(
+                        name=candidate,
+                        description=spec.get("description") or "",
+                        parameters_json_schema=parameters,
+                    )
+                )
+        decls.sort(key=lambda d: d.name)
+        ctx.turn.functions_offered = bool(decls)
+        return decls
+
     _LEVEL_ORDER = ("minimal", "low", "medium", "high")
     _EFFORT_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
 
@@ -2245,6 +2290,299 @@ class Pipe:
     def _format_notice(self, text: str) -> str:
         return "\n> ⚠️ " + text + "\n"
 
+    _TOOL_RESULT_CHAR_CAP = 100_000
+    _OWUI_CALL_TOOL_NAME = "call_tool"
+    _OWUI_SEARCH_TOOL_NAME = "search_tools"
+
+    @staticmethod
+    def _filter_tool_args(tool_entry: Any, args: dict) -> dict:
+        if not isinstance(args, dict) or not args:
+            return args if isinstance(args, dict) else {}
+        spec = (tool_entry or {}).get("spec") if isinstance(tool_entry, dict) else None
+        if not isinstance(spec, dict):
+            return args
+        params = spec.get("parameters")
+        if not isinstance(params, dict) or not isinstance(params.get("properties"), dict):
+
+            return args
+        allowed = params["properties"].keys()
+        kept = {k: v for k, v in args.items() if k in allowed}
+        dropped = [k for k in args if k not in allowed]
+        if dropped:
+            logger.warning(
+                "Tool '%s': dropped undeclared argument(s) %s not in its schema",
+                spec.get("name", "?"),
+                dropped,
+            )
+        return kept
+
+    @classmethod
+    def _resolve_owui_call_tool(
+        cls, tool_input: Any, tools: dict
+    ) -> Tuple[str, dict, Optional[str]]:
+        try:
+            if not isinstance(tool_input, dict) or set(tool_input) != {"tool_name", "params"}:
+                raise ValueError("call_tool requires tool_name and params.")
+            name = tool_input["tool_name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("tool_name must be a non-empty string.")
+            if name in {cls._OWUI_SEARCH_TOOL_NAME, cls._OWUI_CALL_TOOL_NAME}:
+                raise ValueError("call_tool cannot invoke search_tools or itself.")
+            if name not in tools:
+                raise ValueError(f'Tool "{name}" is not available. Search for an available tool.')
+            params = tool_input["params"]
+            if isinstance(params, str):
+                params = json.loads(params) if params.strip() else {}
+            if not isinstance(params, dict):
+                raise ValueError("params must decode to a JSON object.")
+        except (TypeError, ValueError) as error:
+            return cls._OWUI_CALL_TOOL_NAME, {}, f"Error: {error}"
+        return name, params, None
+
+    async def _start_function_call(self, ctx, call, fc: dict) -> None:
+        original_name = ctx.turn.name_map.get(fc["name"], fc["name"])
+        await ctx.status.running_tool(original_name)
+        await ctx.upsert_block(
+            fc["key"],
+            self._format_tool_result_block(
+                fc["id"], original_name, fc["args"], "", done=False
+            ),
+            call.index,
+        )
+        if not ctx.turn.functions_offered:
+            fc["error"] = "function calling is not available"
+            return
+        max_calls = max(int(getattr(self.valves, "MAX_TOOL_CALLS", 1) or 1), 1)
+        if ctx.turn.tool_calls_made >= max_calls:
+            fc["error"] = "tool call limit reached (MAX_TOOL_CALLS)"
+            return
+        ctx.turn.tool_calls_made += 1
+        fc["task"] = asyncio.create_task(self._execute_tool_call(ctx, fc))
+
+    async def _execute_tool_call(self, ctx, fc: dict) -> dict:
+        name = ctx.turn.name_map.get(fc["name"], fc["name"])
+        args = fc["args"] if isinstance(fc["args"], dict) else {}
+        files: List[Any] = []
+        embeds: List[Any] = []
+        error_text: Optional[str] = None
+        text = ""
+        try:
+            tools = ctx.tools or {}
+            builtin = ctx.builtin_tools or {}
+            target = None
+            if (tools.get(name) or {}).get("tool_id") == f"builtin:{self._OWUI_CALL_TOOL_NAME}":
+                name, args, dispatch_error = self._resolve_owui_call_tool(args, tools)
+                if dispatch_error:
+                    error_text = dispatch_error
+                else:
+                    target = tools.get(name)
+            if error_text is None and (target is None or not (target or {}).get("callable")):
+                target = tools.get(name)
+                if target is not None and not target.get("callable"):
+                    target = None
+            if error_text is None and target is None:
+                entry = builtin.get(name)
+                if isinstance(entry, dict) and entry.get("callable"):
+                    target = entry
+            if error_text is None and target is None:
+                logger.warning(
+                    "Tool '%s' not found in __tools__ or builtin_tools", name
+                )
+                error_text = json.dumps(
+                    {
+                        "error": (
+                            f"Tool '{name}' is not available. It may require "
+                            "server context or is not configured."
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+            if error_text is None:
+                args = self._filter_tool_args(target, args)
+                approved, denial = await self._await_tool_approval(
+                    {"id": fc.get("raw_id"), "name": name, "args": args}
+                )
+                if not approved:
+                    error_text = denial
+                else:
+                    timeout_s = getattr(self.valves, "TOOL_CALL_TIMEOUT", 60)
+                    outcome = target["callable"](**args)
+                    if inspect.isawaitable(outcome):
+                        try:
+                            outcome = await asyncio.wait_for(
+                                outcome, timeout=max(1, float(timeout_s))
+                            )
+                        except asyncio.TimeoutError:
+                            error_text = (
+                                f"Error executing tool '{name}': "
+                                f"timed out after {timeout_s}s"
+                            )
+                    if error_text is None and PROCESS_TOOL_RESULT_AVAILABLE and ctx.request is not None:
+                        try:
+                            outcome, files, embeds = await process_tool_result(
+                                ctx.request,
+                                name,
+                                outcome,
+                                "pipe",
+                                metadata=ctx.metadata,
+                                user=ctx.user,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"process_tool_result failed for '{name}': {e}"
+                            )
+                    if error_text is None:
+                        if isinstance(outcome, str):
+                            text = outcome
+                        elif isinstance(outcome, (dict, list)):
+                            try:
+                                text = json.dumps(outcome, ensure_ascii=False)
+                            except (TypeError, ValueError):
+                                text = str(outcome)
+                        else:
+                            text = str(outcome)
+        except Exception as e:
+            logger.error(f"Tool call '{name}' failed: {e}")
+            error_text = f"Error executing tool '{name}': {e}"
+            files, embeds = [], []
+        if error_text is not None:
+            text = error_text
+        is_error = error_text is not None or text.startswith(
+            ("Error:", "Error executing tool")
+        )
+        return {"text": text, "files": files, "embeds": embeds, "error": is_error}
+
+    async def _await_tool_approval(self, tool_call: dict) -> Tuple[bool, Optional[str]]:
+        mode, event_call = TOOL_APPROVAL.get()
+        name = str(tool_call.get("name") or "tool")
+        if mode != "ask":
+            return True, None
+        denial = json.dumps(
+            {"error": f"The user denied permission to run '{name}'."},
+            ensure_ascii=False,
+        )
+        if event_call is None:
+            return False, denial
+        try:
+            args = json.dumps(tool_call.get("args") or {}, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            args = str(tool_call.get("args"))
+        if len(args) > 2000:
+            args = args[:2000] + "\n… (truncated)"
+        try:
+            answer = await event_call(
+                {
+                    "type": "confirmation",
+                    "data": {
+                        "title": f"Run tool: {name}?",
+                        "message": (
+                            f"The model wants to call `{name}` with:\n\n"
+                            f"```json\n{args}\n```"
+                        ),
+
+                        "tool_call": {
+                            "id": tool_call.get("id"),
+                            "name": name,
+                            "arguments": tool_call.get("args") or {},
+                        },
+                    },
+                }
+            )
+        except Exception as e:
+
+            logger.warning("Tool approval prompt failed for '%s': %s", name, e)
+            answer = False
+        if answer is True:
+            logger.info("Tool '%s' approved by user", name)
+            return True, None
+        logger.info("Tool '%s' denied by user", name)
+        return False, denial
+
+    async def _finish_function_calls(self, ctx, call) -> gtypes.Content:
+
+        async def _tagged(fc: dict, task) -> Tuple[dict, dict]:
+            try:
+                return fc, await task
+            except asyncio.CancelledError:
+                return fc, {"text": "tool call cancelled", "error": True}
+
+        for fc in call.function_calls:
+            if fc.get("error"):
+                original_name = ctx.turn.name_map.get(fc["name"], fc["name"])
+                await ctx.upsert_block(
+                    fc["key"],
+                    self._format_tool_result_block(
+                        fc["id"],
+                        original_name,
+                        fc["args"],
+                        fc["error"],
+                        is_error=True,
+                        done=True,
+                    ),
+                    call.index,
+                )
+                fc["outcome"] = {"text": fc["error"], "error": True}
+
+        tasks = [(fc, fc["task"]) for fc in call.function_calls if fc.get("task") is not None]
+        if tasks:
+            for finished in asyncio.as_completed(
+                [_tagged(fc, task) for fc, task in tasks]
+            ):
+                fc, outcome = await finished
+                outcome = outcome or {"text": "", "error": False}
+                text = str(outcome.get("text") or "")
+                is_error = bool(outcome.get("error"))
+                files = outcome.get("files") or []
+                embeds = outcome.get("embeds") or []
+                if files:
+                    await ctx.emit_event(
+                        {"type": "files", "data": {"files": files}}
+                    )
+                original_name = ctx.turn.name_map.get(fc["name"], fc["name"])
+                await ctx.upsert_block(
+                    fc["key"],
+                    self._format_tool_result_block(
+                        fc["id"],
+                        original_name,
+                        fc["args"],
+                        text,
+                        is_error=is_error,
+                        done=True,
+                        embeds=embeds,
+                        files=files,
+                    ),
+                    call.index,
+                )
+                fc["outcome"] = {"text": text, "error": is_error}
+
+        parts: List[gtypes.Part] = []
+        for fc in call.function_calls:
+            outcome = fc.get("outcome") or {"text": "", "error": False}
+            text = str(outcome.get("text") or "")
+            if len(text) > self._TOOL_RESULT_CHAR_CAP:
+                text = text[: self._TOOL_RESULT_CHAR_CAP] + "\n… (truncated)"
+            if outcome.get("error"):
+                response: Dict[str, Any] = {"error": text}
+            else:
+                response = self._tool_response_payload(text)
+            parts.append(
+                gtypes.Part(
+                    function_response=gtypes.FunctionResponse(
+                        id=fc.get("raw_id"),
+                        name=fc["name"],
+                        response=response,
+                    )
+                )
+            )
+        return gtypes.Content(role="user", parts=parts)
+
+    @staticmethod
+    def _tool_response_payload(text: str) -> dict:
+        try:
+            return {"result": json.loads(text)}
+        except (TypeError, ValueError):
+            return {"result": text}
+
     _THOUGHT_RENDER_INTERVAL = 0.3
 
     async def _stream_call(self, ctx, client, contents, config, call) -> None:
@@ -2322,6 +2660,7 @@ class Pipe:
             call.function_calls.append(
                 {
                     "part": part,
+                    "raw_id": _get(function_call, "id"),
                     "id": _get(function_call, "id")
                     or f"call_{call.index}_{len(call.function_calls)}",
                     "name": _get(function_call, "name") or "tool",
@@ -2329,6 +2668,7 @@ class Pipe:
                     "key": f"fc:{call.index}:{len(call.function_calls)}",
                 }
             )
+            await self._start_function_call(ctx, call, call.function_calls[-1])
             return
 
         tool_call = _get(part, "tool_call")
@@ -2681,7 +3021,7 @@ class Pipe:
         retry_after: Optional[float],
     ) -> None:
         ctx.msg.rollback(checkpoint)
-        self._reset_call(call)
+        self._reset_call(call, ctx)
         await ctx.emit_replace()
         await ctx.status.activity(f"Retrying ({attempt}/{max_retries})…")
         delay = self._retry_delay(attempt, retry_after)
@@ -2695,7 +3035,16 @@ class Pipe:
         delay = (base ** attempt) + random.uniform(0.0, 0.25 * base)
         return min(delay, self._RETRY_BACKOFF_CAP)
 
-    def _reset_call(self, call) -> None:
+    def _reset_call(self, call, ctx=None) -> None:
+        started = 0
+        for fc in call.function_calls:
+            task = fc.get("task") if isinstance(fc, dict) else None
+            if task is not None:
+                started += 1
+                if not task.done():
+                    task.cancel()
+        if ctx is not None and started:
+            ctx.turn.tool_calls_made = max(0, ctx.turn.tool_calls_made - started)
         call.raw_parts = []
         call.function_calls = []
         call.grounding = GroundingAccumulator()
@@ -3480,10 +3829,12 @@ class Pipe:
             user=user,
             user_valves=user_valves,
             metadata=__metadata__ or {},
-            request={},
+            request=__request__,
             api_key=api_key,
             tools=dict(__tools__ or {}),
-            builtin_tools={},
+            builtin_tools=await self._gather_builtin_tools(
+                __request__, user, __event_emitter__, __metadata__, __tools__
+            ),
             rag_offset=_rag_citation_offset((__metadata__ or {}).get("sources") or []),
         )
 
@@ -3501,7 +3852,7 @@ class Pipe:
             flags = self._resolve_builtin_flags(
                 ctx.metadata, self.valves, user_valves, info, self._last_user_text(body)
             )
-            decls: List = []
+            decls = self._build_function_declarations(ctx)
             tools, tool_config, notes = self._assemble_tools(info, flags, decls)
             for note in notes:
                 await ctx.status.activity(note)
@@ -3587,25 +3938,123 @@ class Pipe:
         await ctx.upsert_block("markers", "".join(markers), call)
 
     async def _run_generation_loop(self, ctx, contents, config, client) -> None:
-        max_calls = max(int(getattr(self.valves, "MAX_TOOL_CALLS", 1) or 1), 1) + 1
-        for call_index in range(max_calls):
-            call = CallState(index=call_index)
+        max_tool_calls = max(int(getattr(self.valves, "MAX_TOOL_CALLS", 1) or 1), 1)
+        retried: set = set()
+        for _iteration in range(max_tool_calls + 3):
+            call = CallState(index=len(ctx.turn.calls))
             ctx.turn.calls.append(call)
+            checkpoint = ctx.msg.checkpoint()
             await self._stream_call_with_retries(ctx, client, contents, config, call)
             await self._finalize_call(ctx, call)
+            finish_name = (
+                getattr(call.finish_reason, "name", str(call.finish_reason))
+                if call.finish_reason is not None
+                else ""
+            )
+            if (
+                finish_name
+                in ("MALFORMED_FUNCTION_CALL", "MISSING_THOUGHT_SIGNATURE")
+                and finish_name not in retried
+            ):
+
+                self._reset_call(call, ctx)
+                ctx.msg.rollback(checkpoint)
+                await ctx.emit_replace()
+                if finish_name == "MISSING_THOUGHT_SIGNATURE":
+                    self._restore_missing_signatures(contents)
+                retried.add(finish_name)
+                continue
+            if not call.function_calls:
+                return
             replay = self._merge_replay_parts(call.raw_parts)
             if replay:
                 contents.append(gtypes.Content(role="model", parts=replay))
-            if not call.function_calls:
-                return
-            await ctx.upsert_block(
-                f"toolstop:{call.index}",
-                self._format_notice(
-                    "Tool calls are not supported in this milestone; stopping here"
-                ),
-                call.index,
+            contents.append(await self._finish_function_calls(ctx, call))
+            if ctx.turn.tool_calls_made >= max_tool_calls:
+                config = self._disable_function_calling(config)
+
+    async def _gather_builtin_tools(
+        self, __request__, user, __event_emitter__, __metadata__, __tools__
+    ) -> dict:
+        builtin_tools: dict = {}
+        if BUILTIN_TOOLS_AVAILABLE and __request__ is not None:
+            try:
+                memory_enabled = (
+                    user.get("settings", {}).get("ui", {}).get("memory", False)
+                    if user
+                    else False
+                )
+                builtin_tools = get_builtin_tools(
+                    __request__,
+                    {
+                        "__user__": user,
+                        "__event_emitter__": __event_emitter__,
+                        "__chat_id__": (__metadata__ or {}).get("chat_id"),
+                        "__message_id__": (__metadata__ or {}).get("message_id"),
+                    },
+                    features={"memory": memory_enabled},
+                    model={"info": {"meta": {"builtinTools": {"skills": False}}}},
+                )
+                if inspect.isawaitable(builtin_tools):
+                    builtin_tools = await builtin_tools
+                logger.debug(
+                    f"Loaded {len(builtin_tools)} builtin tools: "
+                    f"{list(builtin_tools.keys())}"
+                )
+            except Exception as e:
+                logger.warning(f"Could not load builtin tools: {e}")
+                builtin_tools = {}
+        metadata_tools = (__metadata__ or {}).get("tools", {})
+        if metadata_tools:
+            for t_name, t_data in metadata_tools.items():
+                if t_name in builtin_tools:
+                    continue
+                if __tools__ and t_name in __tools__:
+                    continue
+                if isinstance(t_data, dict) and t_data.get("callable"):
+                    builtin_tools[t_name] = t_data
+        if builtin_tools:
+            logger.debug(f"Executable tool set: {list(builtin_tools.keys())}")
+        return builtin_tools
+
+    def _restore_missing_signatures(self, contents: List[gtypes.Content]) -> None:
+        last_user = -1
+        for index, content in enumerate(contents):
+            if content.role == "user":
+                last_user = index
+        for content in contents[last_user + 1 :]:
+            if content.role != "model":
+                continue
+            if not any(getattr(p, "text", None) for p in content.parts):
+                continue
+            for index, part in enumerate(content.parts):
+                if (
+                    getattr(part, "function_call", None) is not None
+                    and getattr(part, "thought_signature", None) is None
+                ):
+                    content.parts[index] = part.model_copy(
+                        update={"thought_signature": DUMMY_THOUGHT_SIGNATURE}
+                    )
+                    break
+
+    @staticmethod
+    def _disable_function_calling(config) -> gtypes.GenerateContentConfig:
+        config = config.model_copy(deep=True)
+        tool_config = config.tool_config
+        if tool_config is None:
+            tool_config = gtypes.ToolConfig(
+                function_calling_config=gtypes.FunctionCallingConfig(mode="NONE")
             )
-            return
+        else:
+            tool_config = tool_config.model_copy(
+                update={
+                    "function_calling_config": gtypes.FunctionCallingConfig(
+                        mode="NONE"
+                    )
+                }
+            )
+        config.tool_config = tool_config
+        return config
 
     async def _finalise(self, ctx, metadata: Optional[dict]) -> str:
         text = ctx.text()

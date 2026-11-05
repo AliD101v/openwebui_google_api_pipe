@@ -169,3 +169,55 @@ class _Tools:
             tool_config = gtypes.ToolConfig(retrieval_config=retrieval)
 
         return tools, tool_config, notes
+
+    @staticmethod
+    def _sanitize_function_name(name: str) -> str:
+        """A name Gemini accepts: [A-Za-z0-9_.:-], letter or _ first, at most 64 chars."""
+        cleaned = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(name or ""))
+        if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
+            cleaned = "_" + cleaned
+        return cleaned[:64]
+
+    def _build_function_declarations(self, ctx) -> list:
+        """The FunctionDeclarations for this turn's executable tools.
+
+        User tools first, then built-in tools: an original name offered twice
+        is declared once, a sanitised-name collision gets a _2/_3/... suffix,
+        and ``ctx.turn.name_map`` maps every declared name back to the
+        callable's original name for execution and rendering.
+        """
+        decls: List[gtypes.FunctionDeclaration] = []
+        offered_originals: set = set()
+        taken: set = set()
+        for source in (ctx.tools or {}, ctx.builtin_tools or {}):
+            for original, entry in source.items():
+                original = str(original)
+                if original in offered_originals:
+                    continue
+                if original.startswith("_"):
+                    continue
+                if not isinstance(entry, dict) or not entry.get("callable"):
+                    continue
+                offered_originals.add(original)
+                spec = entry.get("spec")
+                spec = spec if isinstance(spec, dict) else {}
+                candidate = self._sanitize_function_name(original)
+                suffix = 2
+                while candidate in taken:
+                    candidate = f"{self._sanitize_function_name(original)}_{suffix}"
+                    suffix += 1
+                taken.add(candidate)
+                ctx.turn.name_map[candidate] = original
+                parameters = spec.get("parameters")
+                if not isinstance(parameters, dict):
+                    parameters = {"type": "object", "properties": {}}
+                decls.append(
+                    gtypes.FunctionDeclaration(
+                        name=candidate,
+                        description=spec.get("description") or "",
+                        parameters_json_schema=parameters,
+                    )
+                )
+        decls.sort(key=lambda d: d.name)
+        ctx.turn.functions_offered = bool(decls)
+        return decls
