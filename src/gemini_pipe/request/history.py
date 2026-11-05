@@ -1,8 +1,10 @@
 """Chat history -> Gemini Contents (text and images), request side.
 
-The assistant's persisted text is reduced to its replayable prose: everything
-this pipe rendered into it (reasoning, tool calls, search blocks, citations,
-notices) is stripped, so a continued conversation carries no UI artefacts.
+The assistant's persisted text is reduced to its replayable form: the
+reasoning, search blocks, citations and notices this pipe rendered into it
+are stripped, and the persisted tool-call blocks are replayed as
+function_call / function_response pairs, so a continued conversation carries
+no UI artefacts but does carry the tools it already called.
 """
 from __future__ import annotations
 
@@ -36,6 +38,10 @@ class _History:
     _PATTERN_TOOL_CALLS_DETAILS = re.compile(
         r'<details\b[^>]*\btype="tool_calls"[^>]*>.*?</details>', flags=re.DOTALL
     )
+    # The opening tag of one <details> block (attribute values are
+    # HTML-escaped, so no raw '>' or '"' can hide inside them).
+    _PATTERN_DETAILS_OPEN_TAG = re.compile(r"<[^>]*>")
+    _PATTERN_HTML_ATTR = re.compile(r'(\w+)="([^"]*)"')
     _PATTERN_FILES_URL = re.compile(r"/api/v1/files/([0-9a-fA-F-]+)/content")
     _PATTERN_DATA_URL = re.compile(r"^data:[^,]*;base64,(.*)$", flags=re.DOTALL)
     _PATTERN_CITATION_RUN = re.compile(r"(?:\[\d+\])+")
@@ -95,11 +101,9 @@ class _History:
                 if parts:
                     contents.append(gtypes.Content(role="user", parts=parts))
             elif role == "assistant":
-                text = self._assistant_text(message.get("content", ""))
-                if text:
-                    contents.append(
-                        gtypes.Content(role="model", parts=[gtypes.Part(text=text)])
-                    )
+                contents.extend(
+                    self._assistant_contents(message.get("content", ""))
+                )
 
         merged: List[gtypes.Content] = []
         for content in contents:
@@ -308,18 +312,143 @@ class _History:
         text = self._block_text(content)
         if not text:
             return ""
+        text, _ = self._assistant_clean(text, keep_tool_calls=False)
+        return text.strip()
+
+    def _assistant_clean(self, text: str, keep_tool_calls: bool) -> Tuple[str, bool]:
+        """The cleaning both history paths share: metadata markers, reasoning
+        and built-in blocks, and decorative lines. With ``keep_tool_calls``
+        False, the tool-call blocks and (after a google_search block) the
+        citation runs go too. Returns the cleaned text and whether a
+        google_search block was present."""
         had_search_block = 'name="google_search"' in text
         text = self._PATTERN_METADATA_MARKER.sub("", text)
         text = self._PATTERN_REASONING_DETAILS.sub("", text)
         text = self._PATTERN_BUILTIN_DETAILS.sub("", text)
-        text = self._PATTERN_TOOL_CALLS_DETAILS.sub("", text)
+        if not keep_tool_calls:
+            text = self._PATTERN_TOOL_CALLS_DETAILS.sub("", text)
         text = self._strip_decorative_lines(text)
-        if had_search_block:
+        if not keep_tool_calls and had_search_block:
             # Citation numbers are only valid within the call that produced
             # them; replayed text would point at the wrong sources, so the
             # markers go away with the search block.
             text = self._strip_citation_runs(text)
-        return text.strip()
+        return text, had_search_block
+
+    def _assistant_contents(self, content: Any) -> List[gtypes.Content]:
+        """The Gemini Contents for one assistant message: its replayable
+        prose, with the persisted tool-call blocks replayed as
+        function_call parts on the model turn and the matching
+        function_response parts on a following user turn. Consecutive blocks
+        (separated only by whitespace) form one group and share one of each
+        turn; the first function_call of a group carries the thought
+        signature."""
+        text = self._block_text(content)
+        if not text:
+            return []
+        text, had_search_block = self._assistant_clean(text, keep_tool_calls=True)
+
+        segments: List[Tuple[str, str]] = []
+        last_end = 0
+        for match in self._PATTERN_TOOL_CALLS_DETAILS.finditer(text):
+            segments.append(("text", text[last_end:match.start()]))
+            segments.append(("tool_call", match.group(0)))
+            last_end = match.end()
+        segments.append(("text", text[last_end:]))
+
+        def prose(segment: str) -> str:
+            if had_search_block:
+                # The citation runs live in the prose only; the block
+                # attributes keep their raw result text.
+                segment = self._strip_citation_runs(segment)
+            return segment.strip()
+
+        contents: List[gtypes.Content] = []
+        model_parts: Optional[List[gtypes.Part]] = None
+        index = 0
+        while index < len(segments):
+            kind, data = segments[index]
+            if kind == "text":
+                segment = prose(data)
+                if segment:
+                    if model_parts is None:
+                        model_parts = []
+                    model_parts.append(gtypes.Part(text=segment))
+                index += 1
+                continue
+            group: List[str] = []
+            while index < len(segments) and segments[index][0] == "tool_call":
+                group.append(segments[index][1])
+                index += 1
+                if (
+                    index < len(segments)
+                    and segments[index][0] == "text"
+                    and not prose(segments[index][1])
+                ):
+                    index += 1
+            fc_parts, fr_parts = self._tool_call_group_parts(group)
+            if fc_parts:
+                if model_parts is None:
+                    model_parts = []
+                model_parts.extend(fc_parts)
+                contents.append(gtypes.Content(role="model", parts=model_parts))
+                model_parts = None
+            if fr_parts:
+                contents.append(gtypes.Content(role="user", parts=fr_parts))
+        if model_parts:
+            contents.append(gtypes.Content(role="model", parts=model_parts))
+        return contents
+
+    def _tool_call_group_parts(
+        self, blocks: List[str]
+    ) -> Tuple[List[gtypes.Part], List[gtypes.Part]]:
+        """The function_call parts and the matching function_response parts
+        for one group of persisted tool-call blocks, in block order. The
+        first function_call carries the thought signature; blocks that never
+        completed (done="false") or lack an id/name are dropped."""
+        fc_parts: List[gtypes.Part] = []
+        fr_parts: List[gtypes.Part] = []
+        for block in blocks:
+            tag = self._PATTERN_DETAILS_OPEN_TAG.match(block)
+            if not tag:
+                continue
+            attrs = dict(self._PATTERN_HTML_ATTR.findall(tag.group(0)))
+            tc_id = html.unescape(attrs.get("id") or "")
+            tc_name = html.unescape(attrs.get("name") or "")
+            if not tc_id or not tc_name:
+                logger.warning(
+                    "skipping a <details type='tool_calls'> block with a "
+                    "missing id or name during history replay"
+                )
+                continue
+            if (attrs.get("done") or "true") != "true":
+                continue
+            name = self._sanitize_function_name(tc_name)
+            try:
+                args = json.loads(html.unescape(attrs.get("arguments") or ""))
+                if not isinstance(args, dict):
+                    args = {}
+            except (ValueError, TypeError):
+                args = {}
+            part_kwargs: dict = {
+                "function_call": gtypes.FunctionCall(id=tc_id, name=name, args=args)
+            }
+            if not fc_parts:
+                part_kwargs["thought_signature"] = DUMMY_THOUGHT_SIGNATURE
+            fc_parts.append(gtypes.Part(**part_kwargs))
+            result_raw = html.unescape(attrs.get("result") or "")
+            try:
+                result = json.loads(result_raw)
+            except (ValueError, TypeError):
+                result = result_raw
+            fr_parts.append(
+                gtypes.Part(
+                    function_response=gtypes.FunctionResponse(
+                        id=tc_id, name=name, response={"result": result}
+                    )
+                )
+            )
+        return fc_parts, fr_parts
 
     def _strip_decorative_lines(self, text: str) -> str:
         kept = []
