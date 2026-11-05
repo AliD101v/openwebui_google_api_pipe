@@ -2016,7 +2016,7 @@ class Pipe:
         with files.get, or a fresh upload polled to ACTIVE.
 
         The cache is two-tier: the Pipe-level dict for this process, and the
-        file's own meta (survives restarts), keyed by file id. Raises
+        file's own meta (survives restarts), both keyed by API-key fingerprint, file id and content hash. Raises
         RuntimeError when Google fails or never finishes processing.
         """
         cache_key = (
@@ -2027,7 +2027,7 @@ class Pipe:
         if entry is None:
             meta = getattr(record, "meta", None)
             if isinstance(meta, dict):
-                entry = (meta.get("gemini_files") or {}).get(file_id)
+                entry = (meta.get("gemini_files") or {}).get(cache_key)
         if entry:
             try:
                 expires = float(entry.get("expires") or 0)
@@ -2077,7 +2077,7 @@ class Pipe:
             try:
                 meta = dict(getattr(record, "meta", None) or {})
                 gemini_files = dict(meta.get("gemini_files") or {})
-                gemini_files[file_id] = stored
+                gemini_files[cache_key] = stored
                 await Files.update_file_metadata_by_id(
                     record.id, {"gemini_files": gemini_files}
                 )
