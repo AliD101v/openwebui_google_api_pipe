@@ -231,6 +231,17 @@ class _Formatting:
             + "\n"
         )
 
+    def _format_maps_attribution_line(self, places: List[Tuple[str, str]]) -> str:
+        """The Google Maps attribution under a maps-grounded answer (Google's
+        terms require naming the source); "" when there are no places."""
+        if not places:
+            return ""
+        return (
+            '📍 <span translate="no">Google Maps</span>: '
+            + " · ".join(f"[{title}]({uri})" for title, uri in places)
+            + "\n"
+        )
+
     def _format_notice(self, text: str) -> str:
         """A short warning line appended to the answer (degraded capability, …)."""
         return "\n> ⚠️ " + text + "\n"

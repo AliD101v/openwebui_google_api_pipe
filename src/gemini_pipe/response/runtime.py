@@ -91,9 +91,12 @@ class _Runtime:
             cache.pop(next(iter(cache)))
 
     async def _apply_grounding(self, ctx, call) -> None:
-        """Cite the call's text, emit its source events and render the search
-        block and Search Suggestions."""
+        """Cite the call's text, emit its source events, and render the Google
+        Search block (web sources) or the Google Maps attribution (places)."""
         acc = call.grounding
+        web_chunks = [c for c in acc.chunks if c.get("kind") == "web"]
+        maps_chunks = [c for c in acc.chunks if c.get("kind") == "maps"]
+
         queries = [q for q in acc.queries if q]
         if queries:
             for query in queries:
@@ -101,11 +104,7 @@ class _Runtime:
                     ctx.turn.search_queries.append(query)
             await ctx.status.searching_google(queries)
 
-        uris = [
-            chunk_["uri"]
-            for chunk_ in acc.chunks
-            if chunk_.get("kind") == "web" and chunk_.get("uri")
-        ]
+        uris = [c["uri"] for c in web_chunks if c.get("uri")]
         resolved = await self._resolve_grounding_urls(uris)
 
         segments = ctx.msg.text_segments(call.index)
@@ -141,36 +140,52 @@ class _Runtime:
                 }
             )
 
-        numbers = sorted(references)
-        urls = [
-            (ctx.turn.citations.sources.get(number) or {}).get("url") or ""
-            for number in numbers
+        web_numbers = [
+            number
+            for number in sorted(references)
+            if (ctx.turn.citations.sources.get(number) or {}).get("kind") == "web"
         ]
-        if urls:
-            await ctx.status.web_search_done(urls, queries)
-
-        source_triples = []
-        for number in numbers:
-            info = ctx.turn.citations.sources.get(number) or {}
-            url = info.get("url") or ""
-            source_triples.append((number, info.get("title") or url, url))
-        embed_html = ""
-        if (
-            self.valves.SHOW_SEARCH_SUGGESTIONS == "embed"
-            and acc.entry_point_html
-        ):
-            embed_html = prepare_entry_point_embed(acc.entry_point_html)
-        block = self._format_google_search_block(
-            call.index, queries, source_triples, embed_html
-        )
-        if block:
-            first_text = (ctx.msg.text_segments(call.index) or [None])[0]
-            await ctx.upsert_block(
-                f"gsearch:{call.index}",
-                block,
-                call.index,
-                before_key=first_text.key if first_text else None,
+        if web_chunks or queries:
+            web_urls = [
+                (ctx.turn.citations.sources.get(number) or {}).get("url") or ""
+                for number in web_numbers
+            ]
+            if web_urls:
+                await ctx.status.web_search_done(web_urls, queries)
+            source_triples = []
+            for number in web_numbers:
+                info = ctx.turn.citations.sources.get(number) or {}
+                url = info.get("url") or ""
+                source_triples.append((number, info.get("title") or url, url))
+            embed_html = ""
+            if (
+                self.valves.SHOW_SEARCH_SUGGESTIONS == "embed"
+                and acc.entry_point_html
+            ):
+                embed_html = prepare_entry_point_embed(acc.entry_point_html)
+            block = self._format_google_search_block(
+                call.index, queries, source_triples, embed_html
             )
+            if block:
+                first_text = (ctx.msg.text_segments(call.index) or [None])[0]
+                await ctx.upsert_block(
+                    f"gsearch:{call.index}",
+                    block,
+                    call.index,
+                    before_key=first_text.key if first_text else None,
+                )
+
+        if maps_chunks:
+            place_uris = [c["uri"] for c in maps_chunks if c.get("uri")]
+            await ctx.status.places_found(place_uris)
+            places = [
+                (c.get("title") or c.get("uri"), c.get("uri"))
+                for c in maps_chunks
+                if c.get("uri")
+            ]
+            maps_block = self._format_maps_attribution_line(places)
+            if maps_block:
+                await ctx.upsert_block(f"maps:{call.index}", maps_block, call.index)
 
         mode = self.valves.SHOW_SEARCH_SUGGESTIONS
         if mode == "links" or (

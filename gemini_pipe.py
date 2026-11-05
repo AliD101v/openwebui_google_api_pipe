@@ -1482,6 +1482,9 @@ class Pipe:
     _PATTERN_DETAILS_OPEN_TAG = re.compile(r"<[^>]*>")
     _PATTERN_HTML_ATTR = re.compile(r'(\w+)="([^"]*)"')
     _PATTERN_FILES_URL = re.compile(r"/api/v1/files/([0-9a-fA-F-]+)/content")
+    _PATTERN_GENERATED_IMAGE = re.compile(
+        r"!\[[^\]]*\]\(/api/v1/files/([0-9a-fA-F-]+)/content\)"
+    )
     _PATTERN_DATA_URL = re.compile(r"^data:[^,]*;base64,(.*)$", flags=re.DOTALL)
     _PATTERN_CITATION_RUN = re.compile(r"(?:\[\d+\])+")
     _PATTERN_CODE_SPANS = re.compile(r"```.*?```|`[^`\n]*`", flags=re.DOTALL)
@@ -1541,7 +1544,7 @@ class Pipe:
                     contents.append(gtypes.Content(role="user", parts=parts))
             elif role == "assistant":
                 contents.extend(
-                    self._assistant_contents(message.get("content", ""))
+                    await self._assistant_contents(message.get("content", ""), info, ctx)
                 )
 
         merged: List[gtypes.Content] = []
@@ -1774,17 +1777,25 @@ class Pipe:
             text = self._strip_citation_runs(text)
         return text, had_search_block
 
-    def _assistant_contents(self, content: Any) -> List[gtypes.Content]:
+    async def _assistant_contents(
+        self, content: Any, info, ctx
+    ) -> List[gtypes.Content]:
         """The Gemini Contents for one assistant message: its replayable
         prose, with the persisted tool-call blocks replayed as
         function_call parts on the model turn and the matching
         function_response parts on a following user turn. Consecutive blocks
         (separated only by whitespace) form one group and share one of each
         turn; the first function_call of a group carries the thought
-        signature."""
+        signature. For image models, generated images referenced by their
+        /files link are re-sent as inline_data parts on the model turn."""
         text = self._block_text(content)
         if not text:
             return []
+        image_parts: List[gtypes.Part] = []
+        if info.get("image_out"):
+            text, image_parts = await self._extract_generated_images(text)
+            if not text.strip() and not image_parts:
+                return []
         text, had_search_block = self._assistant_clean(text, keep_tool_calls=True)
 
         segments: List[Tuple[str, str]] = []
@@ -1836,7 +1847,45 @@ class Pipe:
                 contents.append(gtypes.Content(role="user", parts=fr_parts))
         if model_parts:
             contents.append(gtypes.Content(role="model", parts=model_parts))
+        if image_parts:
+            self._prepend_image_parts(contents, image_parts)
         return contents
+
+    async def _extract_generated_images(
+        self, text: str
+    ) -> Tuple[str, List[gtypes.Part]]:
+        """The prose minus its generated-image links, plus one inline_data
+        part per image a prior turn rendered (carrying the dummy thought
+        signature). Images that cannot be read are dropped from the text too."""
+        parts: List[gtypes.Part] = []
+        for match in self._PATTERN_GENERATED_IMAGE.finditer(text):
+            data = await self._read_file_bytes(match.group(1))
+            if data is None:
+                continue
+            prepared = self._prepare_image_bytes(
+                data, self._sniff_image_media_type(data)
+            )
+            if prepared is None:
+                continue
+            image_bytes, mime_type = prepared
+            parts.append(
+                gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type).model_copy(
+                    update={"thought_signature": DUMMY_THOUGHT_SIGNATURE}
+                )
+            )
+        cleaned = self._PATTERN_GENERATED_IMAGE.sub("", text)
+        return cleaned, parts
+
+    def _prepend_image_parts(
+        self, contents: List[gtypes.Content], image_parts: List[gtypes.Part]
+    ) -> None:
+        """Attach the replayed image parts to the message's first model turn
+        (creating one when it has no other model parts)."""
+        for content in contents:
+            if content.role == "model":
+                content.parts = list(image_parts) + list(content.parts)
+                return
+        contents.insert(0, gtypes.Content(role="model", parts=list(image_parts)))
 
     def _tool_call_group_parts(
         self, blocks: List[str]
@@ -1896,6 +1945,8 @@ class Pipe:
             if stripped.startswith(self._SUGGESTION_LINE_PREFIX):
                 continue
             if stripped.startswith(self._NOTICE_LINE_PREFIX):
+                continue
+            if stripped.startswith("\U0001f4cd ") and "Google Maps" in stripped:
                 continue
             kept.append(line)
         return "\n".join(kept)
@@ -2611,6 +2662,22 @@ class Pipe:
             if schema:
                 kwargs["response_json_schema"] = schema
 
+        if info.get("image_out"):
+            kwargs["response_modalities"] = ["TEXT", "IMAGE"]
+            image_kwargs: dict = {}
+            aspect_ratio = (
+                user_valves.IMAGE_ASPECT_RATIO if user_valves is not None else "auto"
+            ) or "auto"
+            if aspect_ratio != "auto":
+                image_kwargs["aspect_ratio"] = aspect_ratio
+            image_size = (
+                user_valves.IMAGE_SIZE if user_valves is not None else "auto"
+            ) or "auto"
+            if image_size != "auto" and image_size in (info.get("image_sizes") or []):
+                image_kwargs["image_size"] = image_size
+            if image_kwargs:
+                kwargs["image_config"] = gtypes.ImageConfig(**image_kwargs)
+
         return gtypes.GenerateContentConfig(**kwargs)
 
     @staticmethod
@@ -2829,6 +2896,17 @@ class Pipe:
         return (
             "🔎 **Google Search suggestions:** "
             + " · ".join(f"[{label}]({href})" for label, href in links)
+            + "\n"
+        )
+
+    def _format_maps_attribution_line(self, places: List[Tuple[str, str]]) -> str:
+        """The Google Maps attribution under a maps-grounded answer (Google's
+        terms require naming the source); "" when there are no places."""
+        if not places:
+            return ""
+        return (
+            '📍 <span translate="no">Google Maps</span>: '
+            + " · ".join(f"[{title}]({uri})" for title, uri in places)
             + "\n"
         )
 
@@ -3166,6 +3244,74 @@ class Pipe:
         except (TypeError, ValueError):
             return {"result": text}
 
+    async def _start_image_output(self, ctx, call, part) -> None:
+        """Render a "saving image" placeholder and start storing one generated
+        image; the store result replaces the placeholder once it finishes."""
+        key = f"img:{call.index}:{len(call.image_tasks)}"
+        await ctx.upsert_block(key, "\n_🖼️ Saving image…_\n", call.index)
+        await ctx.status.activity("🖼️ Saving image…")
+        inline = _get(part, "inline_data")
+        data = _get(inline, "data") or b""
+        mime = _get(inline, "mime_type") or "image/png"
+
+        async def _save() -> None:
+            url = await self._store_generated_image(ctx, data, mime)
+            if url:
+                block = f"\n![Generated image]({url})\n"
+            else:
+                block = self._format_notice("Generated image could not be saved")
+            await ctx.upsert_block(key, block, call.index)
+
+        call.image_tasks.append(asyncio.create_task(_save()))
+
+    async def _store_generated_image(self, ctx, data: bytes, mime: str) -> Optional[str]:
+        """Persist one generated image in OpenWebUI and return its /files
+        content URL; None when no storage is available or the store fails."""
+        metadata = {
+            "chat_id": (ctx.metadata or {}).get("chat_id"),
+            "message_id": (ctx.metadata or {}).get("message_id"),
+        }
+        user_id = (ctx.user or {}).get("id")
+        try:
+            if UPLOAD_IMAGE_AVAILABLE and USERS_AVAILABLE and ctx.request:
+                user = await Users.get_user_by_id(user_id)
+                file_item, _ = await upload_image(
+                    ctx.request, data, mime, metadata, user
+                )
+                return f"/api/v1/files/{file_item.id}/content"
+            if FILES_AVAILABLE:
+                extension = (
+                    mimetypes.guess_extension(mime)
+                    or mimetypes.guess_extension(mime.split(";")[0])
+                    or ".png"
+                )
+                file_id = str(uuid.uuid4())
+                filename = f"generated-image{extension}"
+                _, file_path = Storage.upload_file(io.BytesIO(data), filename, {})
+                await Files.insert_new_file(
+                    user_id=user_id,
+                    form_data=FileForm(
+                        id=file_id,
+                        hash=hashlib.sha256(data).hexdigest(),
+                        filename=filename,
+                        path=file_path,
+                        data={},
+                        meta={
+                            "content_type": mime,
+                            "size": len(data),
+                            "source": "gemini_image_generation",
+                        },
+                    ),
+                )
+                return f"/api/v1/files/{file_id}/content"
+            logger.warning(
+                "no OpenWebUI file storage available for a generated image"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"could not store generated image: {e}")
+            return None
+
     _THOUGHT_RENDER_INTERVAL = 0.3
 
     async def _stream_call(self, ctx, client, contents, config, call) -> None:
@@ -3274,8 +3420,13 @@ class Pipe:
                 await ctx.status.searching_google(queries)
             return
 
-        if not thought and _get(part, "inline_data") is not None:
-            logger.debug("skipping inline_data part (image output is a later milestone)")
+        inline_data = _get(part, "inline_data")
+        if not thought and inline_data is not None:
+            mime = str(_get(inline_data, "mime_type") or "")
+            if mime.startswith("image/"):
+                await self._start_image_output(ctx, call, part)
+            else:
+                logger.debug("skipping non-image inline_data part")
 
     async def _handle_thought_part(self, ctx, call, text: str) -> None:
         """Accumulate one thought part into the call's reasoning run and
@@ -3312,6 +3463,12 @@ class Pipe:
         """After a call's stream ends: close thoughts, apply grounding, report
         URL context, render the finish notice and accumulate usage."""
         await self._close_thought_run(ctx, call)
+
+        if call.image_tasks:
+            try:
+                await asyncio.gather(*call.image_tasks)
+            except Exception:
+                logger.warning("a generated-image store task failed", exc_info=True)
 
         if not call.grounding.empty():
             await self._apply_grounding(ctx, call)
@@ -3452,9 +3609,12 @@ class Pipe:
             cache.pop(next(iter(cache)))
 
     async def _apply_grounding(self, ctx, call) -> None:
-        """Cite the call's text, emit its source events and render the search
-        block and Search Suggestions."""
+        """Cite the call's text, emit its source events, and render the Google
+        Search block (web sources) or the Google Maps attribution (places)."""
         acc = call.grounding
+        web_chunks = [c for c in acc.chunks if c.get("kind") == "web"]
+        maps_chunks = [c for c in acc.chunks if c.get("kind") == "maps"]
+
         queries = [q for q in acc.queries if q]
         if queries:
             for query in queries:
@@ -3462,11 +3622,7 @@ class Pipe:
                     ctx.turn.search_queries.append(query)
             await ctx.status.searching_google(queries)
 
-        uris = [
-            chunk_["uri"]
-            for chunk_ in acc.chunks
-            if chunk_.get("kind") == "web" and chunk_.get("uri")
-        ]
+        uris = [c["uri"] for c in web_chunks if c.get("uri")]
         resolved = await self._resolve_grounding_urls(uris)
 
         segments = ctx.msg.text_segments(call.index)
@@ -3502,36 +3658,52 @@ class Pipe:
                 }
             )
 
-        numbers = sorted(references)
-        urls = [
-            (ctx.turn.citations.sources.get(number) or {}).get("url") or ""
-            for number in numbers
+        web_numbers = [
+            number
+            for number in sorted(references)
+            if (ctx.turn.citations.sources.get(number) or {}).get("kind") == "web"
         ]
-        if urls:
-            await ctx.status.web_search_done(urls, queries)
-
-        source_triples = []
-        for number in numbers:
-            info = ctx.turn.citations.sources.get(number) or {}
-            url = info.get("url") or ""
-            source_triples.append((number, info.get("title") or url, url))
-        embed_html = ""
-        if (
-            self.valves.SHOW_SEARCH_SUGGESTIONS == "embed"
-            and acc.entry_point_html
-        ):
-            embed_html = prepare_entry_point_embed(acc.entry_point_html)
-        block = self._format_google_search_block(
-            call.index, queries, source_triples, embed_html
-        )
-        if block:
-            first_text = (ctx.msg.text_segments(call.index) or [None])[0]
-            await ctx.upsert_block(
-                f"gsearch:{call.index}",
-                block,
-                call.index,
-                before_key=first_text.key if first_text else None,
+        if web_chunks or queries:
+            web_urls = [
+                (ctx.turn.citations.sources.get(number) or {}).get("url") or ""
+                for number in web_numbers
+            ]
+            if web_urls:
+                await ctx.status.web_search_done(web_urls, queries)
+            source_triples = []
+            for number in web_numbers:
+                info = ctx.turn.citations.sources.get(number) or {}
+                url = info.get("url") or ""
+                source_triples.append((number, info.get("title") or url, url))
+            embed_html = ""
+            if (
+                self.valves.SHOW_SEARCH_SUGGESTIONS == "embed"
+                and acc.entry_point_html
+            ):
+                embed_html = prepare_entry_point_embed(acc.entry_point_html)
+            block = self._format_google_search_block(
+                call.index, queries, source_triples, embed_html
             )
+            if block:
+                first_text = (ctx.msg.text_segments(call.index) or [None])[0]
+                await ctx.upsert_block(
+                    f"gsearch:{call.index}",
+                    block,
+                    call.index,
+                    before_key=first_text.key if first_text else None,
+                )
+
+        if maps_chunks:
+            place_uris = [c["uri"] for c in maps_chunks if c.get("uri")]
+            await ctx.status.places_found(place_uris)
+            places = [
+                (c.get("title") or c.get("uri"), c.get("uri"))
+                for c in maps_chunks
+                if c.get("uri")
+            ]
+            maps_block = self._format_maps_attribution_line(places)
+            if maps_block:
+                await ctx.upsert_block(f"maps:{call.index}", maps_block, call.index)
 
         mode = self.valves.SHOW_SEARCH_SUGGESTIONS
         if mode == "links" or (

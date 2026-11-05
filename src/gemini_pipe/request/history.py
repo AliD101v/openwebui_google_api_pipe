@@ -43,6 +43,9 @@ class _History:
     _PATTERN_DETAILS_OPEN_TAG = re.compile(r"<[^>]*>")
     _PATTERN_HTML_ATTR = re.compile(r'(\w+)="([^"]*)"')
     _PATTERN_FILES_URL = re.compile(r"/api/v1/files/([0-9a-fA-F-]+)/content")
+    _PATTERN_GENERATED_IMAGE = re.compile(
+        r"!\[[^\]]*\]\(/api/v1/files/([0-9a-fA-F-]+)/content\)"
+    )
     _PATTERN_DATA_URL = re.compile(r"^data:[^,]*;base64,(.*)$", flags=re.DOTALL)
     _PATTERN_CITATION_RUN = re.compile(r"(?:\[\d+\])+")
     _PATTERN_CODE_SPANS = re.compile(r"```.*?```|`[^`\n]*`", flags=re.DOTALL)
@@ -102,7 +105,7 @@ class _History:
                     contents.append(gtypes.Content(role="user", parts=parts))
             elif role == "assistant":
                 contents.extend(
-                    self._assistant_contents(message.get("content", ""))
+                    await self._assistant_contents(message.get("content", ""), info, ctx)
                 )
 
         merged: List[gtypes.Content] = []
@@ -335,17 +338,25 @@ class _History:
             text = self._strip_citation_runs(text)
         return text, had_search_block
 
-    def _assistant_contents(self, content: Any) -> List[gtypes.Content]:
+    async def _assistant_contents(
+        self, content: Any, info, ctx
+    ) -> List[gtypes.Content]:
         """The Gemini Contents for one assistant message: its replayable
         prose, with the persisted tool-call blocks replayed as
         function_call parts on the model turn and the matching
         function_response parts on a following user turn. Consecutive blocks
         (separated only by whitespace) form one group and share one of each
         turn; the first function_call of a group carries the thought
-        signature."""
+        signature. For image models, generated images referenced by their
+        /files link are re-sent as inline_data parts on the model turn."""
         text = self._block_text(content)
         if not text:
             return []
+        image_parts: List[gtypes.Part] = []
+        if info.get("image_out"):
+            text, image_parts = await self._extract_generated_images(text)
+            if not text.strip() and not image_parts:
+                return []
         text, had_search_block = self._assistant_clean(text, keep_tool_calls=True)
 
         segments: List[Tuple[str, str]] = []
@@ -397,7 +408,45 @@ class _History:
                 contents.append(gtypes.Content(role="user", parts=fr_parts))
         if model_parts:
             contents.append(gtypes.Content(role="model", parts=model_parts))
+        if image_parts:
+            self._prepend_image_parts(contents, image_parts)
         return contents
+
+    async def _extract_generated_images(
+        self, text: str
+    ) -> Tuple[str, List[gtypes.Part]]:
+        """The prose minus its generated-image links, plus one inline_data
+        part per image a prior turn rendered (carrying the dummy thought
+        signature). Images that cannot be read are dropped from the text too."""
+        parts: List[gtypes.Part] = []
+        for match in self._PATTERN_GENERATED_IMAGE.finditer(text):
+            data = await self._read_file_bytes(match.group(1))
+            if data is None:
+                continue
+            prepared = self._prepare_image_bytes(
+                data, self._sniff_image_media_type(data)
+            )
+            if prepared is None:
+                continue
+            image_bytes, mime_type = prepared
+            parts.append(
+                gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type).model_copy(
+                    update={"thought_signature": DUMMY_THOUGHT_SIGNATURE}
+                )
+            )
+        cleaned = self._PATTERN_GENERATED_IMAGE.sub("", text)
+        return cleaned, parts
+
+    def _prepend_image_parts(
+        self, contents: List[gtypes.Content], image_parts: List[gtypes.Part]
+    ) -> None:
+        """Attach the replayed image parts to the message's first model turn
+        (creating one when it has no other model parts)."""
+        for content in contents:
+            if content.role == "model":
+                content.parts = list(image_parts) + list(content.parts)
+                return
+        contents.insert(0, gtypes.Content(role="model", parts=list(image_parts)))
 
     def _tool_call_group_parts(
         self, blocks: List[str]
@@ -457,6 +506,8 @@ class _History:
             if stripped.startswith(self._SUGGESTION_LINE_PREFIX):
                 continue
             if stripped.startswith(self._NOTICE_LINE_PREFIX):
+                continue
+            if stripped.startswith("\U0001f4cd ") and "Google Maps" in stripped:
                 continue
             kept.append(line)
         return "\n".join(kept)

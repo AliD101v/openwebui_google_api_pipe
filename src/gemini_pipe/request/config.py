@@ -147,4 +147,20 @@ class _Config:
             if schema:
                 kwargs["response_json_schema"] = schema
 
+        if info.get("image_out"):
+            kwargs["response_modalities"] = ["TEXT", "IMAGE"]
+            image_kwargs: dict = {}
+            aspect_ratio = (
+                user_valves.IMAGE_ASPECT_RATIO if user_valves is not None else "auto"
+            ) or "auto"
+            if aspect_ratio != "auto":
+                image_kwargs["aspect_ratio"] = aspect_ratio
+            image_size = (
+                user_valves.IMAGE_SIZE if user_valves is not None else "auto"
+            ) or "auto"
+            if image_size != "auto" and image_size in (info.get("image_sizes") or []):
+                image_kwargs["image_size"] = image_size
+            if image_kwargs:
+                kwargs["image_config"] = gtypes.ImageConfig(**image_kwargs)
+
         return gtypes.GenerateContentConfig(**kwargs)

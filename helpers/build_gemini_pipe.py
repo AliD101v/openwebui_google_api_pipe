@@ -43,6 +43,7 @@ METHOD_GROUP_SOURCES: list[str] = [
     "request/config.py",
     "response/formatting.py",
     "response/tool_exec.py",
+    "response/images_out.py",
     "response/stream_parts.py",
     "response/runtime.py",
     "shared/models.py",

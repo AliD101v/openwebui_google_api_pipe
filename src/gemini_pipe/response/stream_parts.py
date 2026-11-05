@@ -123,8 +123,13 @@ class _StreamParts:
                 await ctx.status.searching_google(queries)
             return
 
-        if not thought and _get(part, "inline_data") is not None:
-            logger.debug("skipping inline_data part (image output is a later milestone)")
+        inline_data = _get(part, "inline_data")
+        if not thought and inline_data is not None:
+            mime = str(_get(inline_data, "mime_type") or "")
+            if mime.startswith("image/"):
+                await self._start_image_output(ctx, call, part)
+            else:
+                logger.debug("skipping non-image inline_data part")
 
     async def _handle_thought_part(self, ctx, call, text: str) -> None:
         """Accumulate one thought part into the call's reasoning run and
@@ -161,6 +166,12 @@ class _StreamParts:
         """After a call's stream ends: close thoughts, apply grounding, report
         URL context, render the finish notice and accumulate usage."""
         await self._close_thought_run(ctx, call)
+
+        if call.image_tasks:
+            try:
+                await asyncio.gather(*call.image_tasks)
+            except Exception:
+                logger.warning("a generated-image store task failed", exc_info=True)
 
         if not call.grounding.empty():
             await self._apply_grounding(ctx, call)
