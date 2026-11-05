@@ -34,8 +34,8 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 |---|---|
 | `src/gemini_pipe/pipe_template.py` | Template: frontmatter (version, requirements, changelog), guarded imports, patterns, `class Pipe` + valves, marker pairs. |
 | `src/gemini_pipe/pipe_orchestrator.py` | `pipe()` entry: setup, generation loop, finalisation, cancellation, errors. |
-| `src/gemini_pipe/request/rag.py` | RAG extraction and cleanup of OpenWebUI's injected context. |
-| `src/gemini_pipe/request/history.py` | OpenAI messages → Gemini contents; memory relocation; metadata-marker extraction. |
+| `src/gemini_pipe/request/rag.py` | Memory extraction, metadata markers, removal of natively-sent files from OpenWebUI's RAG context. |
+| `src/gemini_pipe/request/history.py` | OpenWebUI messages → Gemini contents: text, images, memory relocation, tool-call replay, generated-image replay. |
 | `src/gemini_pipe/request/media.py` | Native media: files/YouTube collection, inline vs Files API, anchors. |
 | `src/gemini_pipe/request/tools.py` | Function declarations; combining built-in tools with function tools per generation. |
 | `src/gemini_pipe/request/config.py` | `GenerateContentConfig` assembly; thinking level/budget; `reasoning_effort`. |
@@ -55,7 +55,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 | `helpers/_testlib.py` | Test fakes: `FakeClient`, `FakeEmitter`, `chunk`, `make_pipe`. |
 | `helpers/test_*.py` | Per-feature checks, all offline against the built artifact. |
 | `helpers/smoke_live.py` | Live smoke scenarios (needs a real key). |
-| `gemini_pipe{,_min}.py` | Generated artifacts (committed; install sources). |
+| `gemini_pipe.py`, `gemini_pipe.min.py` | Generated artifacts (committed; install sources). |
 | `gemini_pipe_web_search_toggle.py`, `gemini_pipe_maps_toggle.py`, `gemini_manifold_companion_filter.py` | Companion filters. |
 
 ## Invariants to preserve
@@ -63,7 +63,8 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 - `_build_genai_client` is the **single decryption point** for API keys and passes `vertexai=False`; every code path gets its client from there.
 - Model parts are **replayed raw**; signed parts are never merged (merging drops thought signatures and breaks the next call).
 - Function responses are replayed in **call order** (FC1, FC2, FR1, FR2).
-- History replay stamps `DUMMY_THOUGHT_SIGNATURE` on the first FC of a group that lost its signature.
+- History replay stamps `DUMMY_THOUGHT_SIGNATURE` on the first FC of each replayed group (persisted messages carry no signatures).
+- Built-in blocks (`data-gemini-builtin="1"`: Google Search, URL context) are rendering only: history strips them and never replays them as function calls.
 - Grounding offsets are **UTF-8 bytes**, not characters.
 - Citation numbering is turn-wide and starts **after** OpenWebUI's RAG sources (`rag_offset`).
 - Search Suggestions **must stay visible** in some form (Google's terms); `SHOW_SEARCH_SUGGESTIONS` changes form, not presence.
