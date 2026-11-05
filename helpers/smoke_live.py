@@ -19,6 +19,9 @@ PIPE_FILE = REPO_ROOT / "gemini_pipe.py"
 def _load_pipe():
     spec = importlib.util.spec_from_file_location("gemini_pipe", PIPE_FILE)
     module = importlib.util.module_from_spec(spec)
+    # OpenWebUI registers plugin modules before executing them; dataclasses
+    # with string annotations look their module up in sys.modules.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
