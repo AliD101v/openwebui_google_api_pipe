@@ -403,3 +403,22 @@ def test_smoke_script_skips_without_api_key():
     )
     assert proc.returncode == 0, proc.stderr
     assert "skipped" in proc.stdout
+
+
+def test_url_context_success_status_reads_as_ok():
+    # regression: Google reports URL_RETRIEVAL_STATUS_SUCCESS, which must count as read, not failed
+    pipe = make_pipe(GEMINI_API_KEY="k", RESOLVE_GROUNDING_URLS=False)
+    client = FakeClient(scripts=[[chunk({"candidates": [{
+        "content": {"role": "model", "parts": [{"text": "Summary."}]}, "finishReason": "STOP",
+        "urlContextMetadata": {"urlMetadata": [
+            {"retrievedUrl": "https://a.example", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"},
+            {"retrievedUrl": "https://b.example", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_PAYWALL"}]}}]})]])
+    type(pipe)._build_genai_client = lambda self, *a, **k: client
+    emitter = FakeEmitter()
+    out = asyncio.run(pipe.pipe(
+        {"model": "gemini_pipe.gemini/gemini-4-argon", "messages": [{"role": "user", "content": "Read https://a.example"}]},
+        __user__={"id": "u1", "valves": pipe.UserValves()}, __event_emitter__=emitter,
+        __metadata__={"chat_id": "c", "message_id": "m"}))
+    read = [e["data"] for e in emitter.of_type("status") if "Read" in e["data"].get("description", "")]
+    assert read and read[-1]["urls"] == ["https://a.example"] and "1 failed" in read[-1]["description"]
+    assert "✅ https://a.example" in out or "✅ [https://a.example]" in out or "✅" in out

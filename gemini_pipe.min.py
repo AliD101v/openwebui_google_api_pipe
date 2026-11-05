@@ -2738,9 +2738,10 @@ class Pipe:
             if not url or any(item["url"] == url for item in call.url_meta):
                 continue
             status_value = _get(entry, "url_retrieval_status")
-            call.url_meta.append(
-                {"url": url, "status": getattr(status_value, "name", status_value) or ""}
-            )
+
+            name = str(getattr(status_value, "name", status_value) or "")
+            short = name.replace("URL_RETRIEVAL_STATUS_", "").lower()
+            call.url_meta.append({"url": url, "status": "ok" if short == "success" else short})
 
     @staticmethod
     def _usage_to_dict(usage: Any) -> Dict[str, Any]:
