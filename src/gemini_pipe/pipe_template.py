@@ -540,7 +540,7 @@ class Pipe:
         )
         URL_CONTEXT: Literal["auto", "with_search", "always", "off"] = Field(
             default="auto",
-            description="When to enable the URL context tool: auto adds it for URLs in the last user message",
+            description="When to attach the URL context tool: auto = when web search is on or the latest message contains a non-YouTube URL; with_search = only with web search; always; off",
         )
         MAPS_DEFAULT: bool = Field(
             default=False,
@@ -648,7 +648,7 @@ class Pipe:
         )
         USE_NATIVE_FILES: bool = Field(
             default=True,
-            description="Send PDFs as native inline files instead of RAG text extraction",
+            description="Send audio, video and full-context PDFs to Gemini natively (inline or via the Files API) instead of OpenWebUI's RAG text",
         )
         HIDE_BLOCKS: List[Literal["google_search", "url_context", "google_maps", "reasoning"]] = Field(
             default=[],
@@ -664,10 +664,10 @@ class Pipe:
                 }
             },
             description=(
-                "Block types to hide from your chat. A hidden block is not "
-                "rendered at all — its progress is reported by the status line "
-                "instead. The block is still sent to the API, so hiding it does "
-                "not change the model's view of the conversation."
+                "Collapsible blocks to hide from your chat (Google Search, URL "
+                "context, reasoning). Progress still shows in the status line. "
+                "With the Google Search block hidden, Search Suggestions are shown "
+                "as links instead; the Google Maps attribution is always shown."
             ),
         )
 
@@ -690,7 +690,7 @@ class Pipe:
         )
         SHOW_COST: bool = Field(
             default=True,
-            description="Report the estimated USD cost of the turn in the message usage",
+            description="Show the estimated USD cost of the turn in the status line and the message usage",
         )
 
     def __init__(self):

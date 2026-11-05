@@ -10,7 +10,7 @@ Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Deve
 
 ## Why a native pipe
 
-OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search grounding, inline citations, or native tools. This pipe uses the `google-genai` SDK directly, so every native capability is available: search/Maps grounding with the attribution blocks Google's terms require, thought summaries, function calling with thought signatures, inline or Files-API media, and image output.
+OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search grounding, inline citations, or native tools. This pipe uses the `google-genai` SDK directly, so these native capabilities are available: search/Maps grounding with the attribution blocks Google's terms require, thought summaries, function calling with thought signatures, inline or Files-API media, and image output.
 
 ## Features
 
@@ -30,8 +30,8 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 
 1. Admin → Functions → `+` → paste `gemini_pipe.py` (or `gemini_pipe.min.py`).
 2. Add the filters the same way:
-   - `gemini_pipe_web_search_toggle.py` — forces Google Search on the next Gemini message;
-   - `gemini_pipe_maps_toggle.py` — forces Google Maps grounding on the next Gemini message;
+   - `gemini_pipe_web_search_toggle.py` — turns on Google Search (plus URL context) for the next message; the model decides whether to search;
+   - `gemini_pipe_maps_toggle.py` — turns on Google Maps grounding for the next message;
    - optionally `gemini_manifold_companion_filter.py`, which routes OpenWebUI's own Web Search button to Google Search for Gemini pipe models only.
 3. Set `GEMINI_API_KEY` in the pipe valves (or the environment variables `GEMINI_API_KEY` / `GOOGLE_API_KEY`).
 4. In Admin → Models, for each Gemini model: attach the toggles, and set Function Calling to **Native** for tools.
@@ -48,7 +48,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 | `MODEL_CACHE_TTL_MINUTES` | `1440` | How long the discovered model list is cached; 0 disables the cache |
 | `MODEL_CAPABILITY_OVERRIDES` | `""` | JSON `{model pattern: {capability: value}}` applied over the derived capabilities; a pattern ending in `*` is a prefix match, e.g. `{"gemini-4*": {"maps": false}}` |
 | `WEB_SEARCH_DEFAULT` | `False` | Google Search on every request; otherwise only via the toggle. Off keeps search opt-in because it is billed per search query |
-| `URL_CONTEXT` | `auto` | When to enable the URL context tool: `auto` adds it for URLs in the last user message; also `with_search`, `always`, `off` |
+| `URL_CONTEXT` | `auto` | When to attach the URL context tool: `auto` = when web search is on or the latest message has a non-YouTube URL; `with_search` = only with web search; `always`; `off` |
 | `MAPS_DEFAULT` | `False` | Maps grounding on every request |
 | `MAPS_LATITUDE` / `MAPS_LONGITUDE` | `""` | Default Maps location; empty = none (then the per-user valves, then OpenWebUI's user location) |
 | `BUILTIN_TOOL_CONFLICT` | `prefer_builtin` | Which side wins when a model cannot combine function tools with Google Search/Maps: `prefer_builtin` or `prefer_functions` |
@@ -77,10 +77,10 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 | `IMAGE_ASPECT_RATIO` | `auto` | Aspect ratio for generated images (`1:1` … `21:9`); auto = model default |
 | `IMAGE_SIZE` | `auto` | Size for generated images (`1K`, `2K`, `4K`); auto = model default |
 | `MAPS_LATITUDE` / `MAPS_LONGITUDE` | `""` | Per-user Maps location; empty = use the admin default |
-| `USE_NATIVE_FILES` | `True` | Send PDFs as native inline files instead of RAG text extraction |
-| `HIDE_BLOCKS` | `[]` | Block types to hide (`google_search`, `url_context`, `google_maps`, `reasoning`); a hidden block is not rendered — its progress goes to the status line — but is still sent to the API |
+| `USE_NATIVE_FILES` | `True` | Send audio, video and full-context PDFs to Gemini natively (inline or via the Files API) instead of OpenWebUI's RAG text |
+| `HIDE_BLOCKS` | `[]` | Collapsible blocks to hide (`google_search`, `url_context`, `reasoning`). Progress still shows in the status line; with the search block hidden, Search Suggestions appear as links. The Google Maps attribution is always shown (`google_maps` has no effect) |
 | `SHOW_TOKEN_COUNT` | `Off` | Show context window progress after each response; `With Cache` also shows cached tokens |
-| `SHOW_COST` | `True` | Report the estimated USD cost of the turn in the message usage |
+| `SHOW_COST` | `True` | Show the estimated USD cost of the turn in the status line and the message usage |
 
 ## Web search, URL context and Maps in detail
 
@@ -99,7 +99,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 
 ## Files and media
 
-- **Native:** audio, video and PDF (full context, not extracted text) go to the Gemini API directly, as do images. Other files fall back to OpenWebUI's RAG extraction.
+- **Native:** audio and video files go to the Gemini API directly, as do images. PDFs go natively when the file is set to full context ("Using Entire Document"); otherwise they stay with OpenWebUI's RAG retrieval, like all other file types.
 - **Inline vs Files API:** files up to `INLINE_FILE_MAX_MB` are inlined into the request; larger ones go through the Files API, whose files are retained by Google for 48 hours. The pipe caches the upload (keyed by key fingerprint, file id and hash) in the file's OpenWebUI metadata, so the same attachment is not re-uploaded on every turn.
 - **YouTube links** are converted to native video input; `YOUTUBE_LINKS` picks which links (`most_recent`, `latest_message`, `all`, `off`). Media anchors stay on the user message where the link appeared, so history replay re-anchors files correctly.
 
@@ -121,7 +121,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 ## Privacy
 
 - API keys (admin and per-user) are **encrypted at rest** with `WEBUI_SECRET_KEY` before they reach the database; the single decryption point is the client factory.
-- `STORE_REQUESTS` defaults to **off** (`store=false`), so Google does not retain your prompts for training or abuse monitoring beyond its normal processing.
+- `STORE_REQUESTS` defaults to **off**: the pipe sends `store=false` to opt out of Google's request storage, which Google enables by default on new paid projects. The field is sent only when the installed SDK supports it (google-genai 2.33+).
 - Chat content is **never logged**; the SDK and transport loggers are capped at WARNING, and log lines carry only model names, key fingerprints and counts.
 - Beyond that, **Google's own data policies apply** to whatever you send to the API.
 
