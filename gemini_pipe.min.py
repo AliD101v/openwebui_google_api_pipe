@@ -11,13 +11,14 @@ environment_variables:
     - GEMINI_API_KEY (or GOOGLE_API_KEY)
 
 Supports:
-- Fetches the model list from the Gemini API (cached, with capability detection)
-- Google Search, URL context and Google Maps grounding with citations
-- Function tools with a multi-call loop
-- Thinking/reasoning controls (level or budget, per model generation)
-- Image generation on image models
-- Native file, Files API and YouTube media handling
-- Per-user API key override, stored encrypted
+- Model auto-discovery with per-generation capabilities and overrides
+- Google Search, Maps and URL context grounding with citations
+- Native function tools with a multi-call loop and approval prompts
+- Thinking/reasoning display (level or budget, per model generation)
+- Native audio, video, PDF, image and YouTube media (inline or Files API)
+- Image generation on Nano Banana models
+- Usage stats: context gauge, cached tokens, cost estimate
+- Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
 v0.1.0
