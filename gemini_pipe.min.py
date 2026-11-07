@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.3
+version: 0.1.4
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,9 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.4
+- Fix: follow-up image edits attach the previous image to the new user message (a model-turn replay was ignored by gemini-nano-banana-2.1)
+- New: Native PDFs toggle filter and NATIVE_PDF_DEFAULT valve; FILES_API description corrected
 v0.1.3
 - Fix: a Maps-only answer no longer shows an empty "Google Search" block, and its queries are not counted as billed searches in the cost estimate
 v0.1.2
@@ -1113,6 +1116,10 @@ class Pipe:
             default="auto",
             description="When to upload media files through the Gemini Files API",
         )
+        NATIVE_PDF_DEFAULT: bool = Field(
+            default=False,
+            description="Send every attached PDF to Gemini as a whole document, not only those set to 'Using Entire Document' (the Native PDFs toggle does the same for one chat). Needs the user valve USE_NATIVE_FILES",
+        )
         YOUTUBE_LINKS: Literal["most_recent", "latest_message", "all", "off"] = Field(
             default="most_recent",
             description="Which YouTube links from the conversation to send to the model",
@@ -1406,6 +1413,8 @@ class Pipe:
 
         contents: List[gtypes.Content] = []
         user_index = -1
+
+        latest_images: List[gtypes.Part] = []
         for i, message in enumerate(messages):
             if not isinstance(message, dict):
                 continue
@@ -1416,14 +1425,24 @@ class Pipe:
                 extra = (extra_parts_by_user_idx or {}).get(user_index)
                 if extra:
                     parts = list(extra) + parts
+                if latest_images and i == last_user_index:
+                    resend = latest_images[-14:]
+                    plural = "images" if len(resend) != 1 else "image"
+                    await ctx.status.activity(f"🖼️ Attaching the previous {plural}…")
+                    parts = resend + parts
                 if memories is not None and i == last_user_index:
                     parts = self._append_memories(parts, memories)
                 if parts:
                     contents.append(gtypes.Content(role="user", parts=parts))
             elif role == "assistant":
-                contents.extend(
-                    await self._assistant_contents(message.get("content", ""), info, ctx)
-                )
+                content = message.get("content", "")
+                if info.get("image_out"):
+                    prose = self._block_text(content)
+                    if prose:
+                        content, images = await self._extract_generated_images(prose)
+                        if images:
+                            latest_images = images
+                contents.extend(await self._assistant_contents(content, info, ctx))
 
         merged: List[gtypes.Content] = []
         for content in contents:
@@ -1623,13 +1642,8 @@ class Pipe:
         self, content: Any, info, ctx
     ) -> List[gtypes.Content]:
         text = self._block_text(content)
-        if not text:
+        if not text.strip():
             return []
-        image_parts: List[gtypes.Part] = []
-        if info.get("image_out"):
-            text, image_parts = await self._extract_generated_images(text)
-            if not text.strip() and not image_parts:
-                return []
         text, had_search_block = self._assistant_clean(text, keep_tool_calls=True)
 
         segments: List[Tuple[str, str]] = []
@@ -1680,8 +1694,6 @@ class Pipe:
                 contents.append(gtypes.Content(role="user", parts=fr_parts))
         if model_parts:
             contents.append(gtypes.Content(role="model", parts=model_parts))
-        if image_parts:
-            self._prepend_image_parts(contents, image_parts)
         return contents
 
     async def _extract_generated_images(
@@ -1698,22 +1710,9 @@ class Pipe:
             if prepared is None:
                 continue
             image_bytes, mime_type = prepared
-            parts.append(
-                gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type).model_copy(
-                    update={"thought_signature": DUMMY_THOUGHT_SIGNATURE}
-                )
-            )
+            parts.append(gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type))
         cleaned = self._PATTERN_GENERATED_IMAGE.sub("", text)
         return cleaned, parts
-
-    def _prepend_image_parts(
-        self, contents: List[gtypes.Content], image_parts: List[gtypes.Part]
-    ) -> None:
-        for content in contents:
-            if content.role == "model":
-                content.parts = list(image_parts) + list(content.parts)
-                return
-        contents.insert(0, gtypes.Content(role="model", parts=list(image_parts)))
 
     def _tool_call_group_parts(
         self, blocks: List[str]
@@ -1802,6 +1801,10 @@ class Pipe:
 
         candidates = self._media_candidates(messages, files, prior_entries)
         if getattr(ctx.user_valves, "USE_NATIVE_FILES", True):
+            force_pdf = bool(
+                getattr(self.valves, "NATIVE_PDF_DEFAULT", False)
+                or (ctx.metadata or {}).get("gemini_native_pdf")
+            )
             inline_total = 0
             ordered = sorted(
                 candidates, key=lambda fid: (candidates[fid]["anchor"], fid)
@@ -1810,7 +1813,7 @@ class Pipe:
                 info = candidates[file_id]
                 hint = info["mime_hint"]
                 if hint is not None and not self._is_native_media(
-                    hint, info["context"], info["prior"]
+                    hint, info["context"], info["prior"], force_pdf
                 ):
                     continue
                 name = info["name"]
@@ -1820,7 +1823,7 @@ class Pipe:
                     logger.warning(f"native media: could not read file {file_id} ({name})")
                     continue
                 mime = self._media_mime(record, info)
-                if not self._is_native_media(mime, info["context"], info["prior"]):
+                if not self._is_native_media(mime, info["context"], info["prior"], force_pdf):
                     continue
 
                 part: Optional[Any] = None
@@ -1951,14 +1954,16 @@ class Pipe:
         return info.get("mime_hint")
 
     @staticmethod
-    def _is_native_media(mime: Optional[str], context, has_prior_marker: bool) -> bool:
+    def _is_native_media(
+        mime: Optional[str], context, has_prior_marker: bool, force_pdf: bool = False
+    ) -> bool:
         if not mime:
             return False
         mime = str(mime).lower()
         if mime.startswith("audio/") or mime.startswith("video/"):
             return True
         if mime == "application/pdf":
-            return context == "full" or has_prior_marker
+            return context == "full" or has_prior_marker or force_pdf
         return False
 
     def _inline_cap(self, mime: Optional[str]) -> int:

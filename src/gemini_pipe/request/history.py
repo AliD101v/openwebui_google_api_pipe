@@ -89,6 +89,9 @@ class _History:
 
         contents: List[gtypes.Content] = []
         user_index = -1
+        # Image models: the images of the most recent assistant message that has any. They are attached
+        # to the last user message (see _extract_generated_images for why not to a model turn).
+        latest_images: List[gtypes.Part] = []
         for i, message in enumerate(messages):
             if not isinstance(message, dict):
                 continue
@@ -99,14 +102,24 @@ class _History:
                 extra = (extra_parts_by_user_idx or {}).get(user_index)
                 if extra:
                     parts = list(extra) + parts
+                if latest_images and i == last_user_index:
+                    resend = latest_images[-14:]
+                    plural = "images" if len(resend) != 1 else "image"
+                    await ctx.status.activity(f"🖼️ Attaching the previous {plural}…")
+                    parts = resend + parts
                 if memories is not None and i == last_user_index:
                     parts = self._append_memories(parts, memories)
                 if parts:
                     contents.append(gtypes.Content(role="user", parts=parts))
             elif role == "assistant":
-                contents.extend(
-                    await self._assistant_contents(message.get("content", ""), info, ctx)
-                )
+                content = message.get("content", "")
+                if info.get("image_out"):
+                    prose = self._block_text(content)
+                    if prose:
+                        content, images = await self._extract_generated_images(prose)
+                        if images:
+                            latest_images = images
+                contents.extend(await self._assistant_contents(content, info, ctx))
 
         merged: List[gtypes.Content] = []
         for content in contents:
@@ -347,16 +360,10 @@ class _History:
         function_response parts on a following user turn. Consecutive blocks
         (separated only by whitespace) form one group and share one of each
         turn; the first function_call of a group carries the thought
-        signature. For image models, generated images referenced by their
-        /files link are re-sent as inline_data parts on the model turn."""
+        signature."""
         text = self._block_text(content)
-        if not text:
+        if not text.strip():
             return []
-        image_parts: List[gtypes.Part] = []
-        if info.get("image_out"):
-            text, image_parts = await self._extract_generated_images(text)
-            if not text.strip() and not image_parts:
-                return []
         text, had_search_block = self._assistant_clean(text, keep_tool_calls=True)
 
         segments: List[Tuple[str, str]] = []
@@ -408,16 +415,20 @@ class _History:
                 contents.append(gtypes.Content(role="user", parts=fr_parts))
         if model_parts:
             contents.append(gtypes.Content(role="model", parts=model_parts))
-        if image_parts:
-            self._prepend_image_parts(contents, image_parts)
         return contents
 
     async def _extract_generated_images(
         self, text: str
     ) -> Tuple[str, List[gtypes.Part]]:
         """The prose minus its generated-image links, plus one inline_data
-        part per image a prior turn rendered (carrying the dummy thought
-        signature). Images that cannot be read are dropped from the text too."""
+        part per image a prior turn rendered. Images that cannot be read are
+        dropped from the text too.
+
+        The parts carry no thought signature and go on the NEW user message:
+        probed on the live API, an image replayed in a model turn with the
+        dummy signature was ignored by gemini-nano-banana-2.1 (it redrew the
+        picture), while the same image attached to the user message edited it
+        on both that model and gemini-3-pro-image."""
         parts: List[gtypes.Part] = []
         for match in self._PATTERN_GENERATED_IMAGE.finditer(text):
             data = await self._read_file_bytes(match.group(1))
@@ -429,24 +440,9 @@ class _History:
             if prepared is None:
                 continue
             image_bytes, mime_type = prepared
-            parts.append(
-                gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type).model_copy(
-                    update={"thought_signature": DUMMY_THOUGHT_SIGNATURE}
-                )
-            )
+            parts.append(gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type))
         cleaned = self._PATTERN_GENERATED_IMAGE.sub("", text)
         return cleaned, parts
-
-    def _prepend_image_parts(
-        self, contents: List[gtypes.Content], image_parts: List[gtypes.Part]
-    ) -> None:
-        """Attach the replayed image parts to the message's first model turn
-        (creating one when it has no other model parts)."""
-        for content in contents:
-            if content.role == "model":
-                content.parts = list(image_parts) + list(content.parts)
-                return
-        contents.insert(0, gtypes.Content(role="model", parts=list(image_parts)))
 
     def _tool_call_group_parts(
         self, blocks: List[str]

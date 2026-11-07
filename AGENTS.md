@@ -58,7 +58,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 | `helpers/probe_image_edit.py` | Live probe: which history shape makes an image model edit its earlier image (needs a real key; five image generations per model). |
 | `helpers/probe_tool_combos.py` | Live probe: which built-in/function tool combinations `generateContent` accepts (needs a real key). |
 | `gemini_pipe.py`, `gemini_pipe.min.py` | Generated artifacts (committed; install sources). |
-| `gemini_pipe_web_search_toggle.py`, `gemini_pipe_maps_toggle.py`, `gemini_manifold_companion_filter.py` | Companion filters. |
+| `gemini_pipe_web_search_toggle.py`, `gemini_pipe_maps_toggle.py`, `gemini_pipe_native_pdf_toggle.py`, `gemini_manifold_companion_filter.py` | Companion filters (toggles set `gemini_web_search` / `gemini_maps` / `gemini_native_pdf` in `__metadata__`). |
 
 ## Invariants to preserve
 
@@ -71,6 +71,8 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 - Citation numbering is turn-wide and starts **after** OpenWebUI's RAG sources (`rag_offset`).
 - Search Suggestions **must stay visible** in some form (Google's terms); `SHOW_SEARCH_SUGGESTIONS` changes form, not presence.
 - `google_maps` never shares a request with `google_search` or `url_context` (the API answers 400); capabilities `maps_with_search` / `maps_with_url_context` default to False. A tool-combination 400 retries once without the lower-priority built-in. Google's docs describe combinations for the Interactions API, not `generateContent`: trust `probe_tool_combos.py`, not the docs. Probed 2026-11-07 on `gemini-3.6-flash` and `gemini-4-argon`: Maps alone, Search alone, URL context alone and Search+URL context are accepted; Maps+Search and Maps+URL context are rejected (3.6 Flash answers a generic "invalid argument" without naming the tools, so the retry only catches the named variant); built-ins plus function tools are accepted only with `include_server_side_tool_invocations` and mode `VALIDATED`.
+- Generated images are re-sent on the **new user message** (latest assistant message's images only, no thought signature), never in a model turn: probed 2026-11-07, `gemini-nano-banana-2.1` ignored a model-turn image with the dummy signature and redrew it; `gemini-3-pro-image` accepted both shapes. Re-run `probe_image_edit.py` before changing this.
+- The Native PDFs toggle must not set OpenWebUI's `file_handler` flag: it would switch off OpenWebUI's processing of the files the pipe doesn't send natively.
 - Tool approval: a missing or broken approval channel **denies**, never silently allows.
 - Metadata markers **accumulate forward**: each turn appends prior turns' markers to the saved message.
 - Media anchors stay on the **original user message**, so replay re-anchors files correctly.

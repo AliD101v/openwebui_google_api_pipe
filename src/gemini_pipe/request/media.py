@@ -51,6 +51,10 @@ class _Media:
 
         candidates = self._media_candidates(messages, files, prior_entries)
         if getattr(ctx.user_valves, "USE_NATIVE_FILES", True):
+            force_pdf = bool(
+                getattr(self.valves, "NATIVE_PDF_DEFAULT", False)
+                or (ctx.metadata or {}).get("gemini_native_pdf")
+            )
             inline_total = 0
             ordered = sorted(
                 candidates, key=lambda fid: (candidates[fid]["anchor"], fid)
@@ -59,7 +63,7 @@ class _Media:
                 info = candidates[file_id]
                 hint = info["mime_hint"]
                 if hint is not None and not self._is_native_media(
-                    hint, info["context"], info["prior"]
+                    hint, info["context"], info["prior"], force_pdf
                 ):
                     continue
                 name = info["name"]
@@ -69,7 +73,7 @@ class _Media:
                     logger.warning(f"native media: could not read file {file_id} ({name})")
                     continue
                 mime = self._media_mime(record, info)
-                if not self._is_native_media(mime, info["context"], info["prior"]):
+                if not self._is_native_media(mime, info["context"], info["prior"], force_pdf):
                     continue
 
                 part: Optional[Any] = None
@@ -209,16 +213,19 @@ class _Media:
         return info.get("mime_hint")
 
     @staticmethod
-    def _is_native_media(mime: Optional[str], context, has_prior_marker: bool) -> bool:
+    def _is_native_media(
+        mime: Optional[str], context, has_prior_marker: bool, force_pdf: bool = False
+    ) -> bool:
         """Whether Gemini takes this file natively: audio and video always,
-        PDF only full-context (or already sent on a prior turn), else RAG."""
+        PDF when full-context, already sent on a prior turn or forced (the
+        Native PDFs toggle / NATIVE_PDF_DEFAULT), else RAG."""
         if not mime:
             return False
         mime = str(mime).lower()
         if mime.startswith("audio/") or mime.startswith("video/"):
             return True
         if mime == "application/pdf":
-            return context == "full" or has_prior_marker
+            return context == "full" or has_prior_marker or force_pdf
         return False
 
     def _inline_cap(self, mime: Optional[str]) -> int:

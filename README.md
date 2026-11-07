@@ -7,7 +7,7 @@ Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Deve
 
 ## Status
 
-- **Pipe version:** `0.1.3`
+- **Pipe version:** `0.1.4`
 - **Requirements:** `google-genai>=1.68.0`, `pydantic>=2`, `cryptography`
 - **Recommended OpenWebUI:** `0.11.4+`. OpenWebUI 0.11.0–0.11.3 pinned `google-genai==1.66.0`; installing this pipe upgrades that shared package, so check your instance before relying on new SDK behaviour.
 
@@ -35,6 +35,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 2. Add the filters the same way:
    - `gemini_pipe_web_search_toggle.py` — turns on Google Search (plus URL context) for the next message; the model decides whether to search;
    - `gemini_pipe_maps_toggle.py` — turns on Google Maps grounding for the next message;
+   - `gemini_pipe_native_pdf_toggle.py` — sends the PDFs attached to this chat to Gemini as whole documents, without having to set each file to "Using Entire Document";
    - optionally `gemini_manifold_companion_filter.py`, which routes OpenWebUI's own Web Search button to Google Search for Gemini pipe models only.
 3. Set `GEMINI_API_KEY` in the pipe valves (or the environment variables `GEMINI_API_KEY` / `GOOGLE_API_KEY`).
 4. In Admin → Models, for each Gemini model: attach the toggles, and set Function Calling to **Native** for tools.
@@ -62,7 +63,8 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 | `MAX_RETRIES` | `3` | Maximum number of retries for failed requests |
 | `REQUEST_TIMEOUT` | `600` | Request timeout in seconds for Gemini API calls |
 | `TOOL_CALL_TIMEOUT` | `60` | Timeout in seconds for individual tool call execution |
-| `FILES_API` | `auto` | When to upload media files through the Gemini Files API: `auto`, `always`, `never` |
+| `FILES_API` | `auto` | How a file that is already going to Gemini natively is delivered, not whether it goes native. `auto`: inline in the request when it fits `INLINE_FILE_MAX_MB` (and the 90 MB request total), otherwise uploaded through Google's Files API; `always`: always upload; `never`: always inline, and files too large to inline are skipped with a notice |
+| `NATIVE_PDF_DEFAULT` | `False` | Send every attached PDF natively, not only those set to "Using Entire Document"; the Native PDFs toggle does the same for one chat |
 | `INLINE_FILE_MAX_MB` | `20` | Maximum file size in MB to inline instead of using the Files API |
 | `YOUTUBE_LINKS` | `most_recent` | Which YouTube links from the conversation to send to the model: `most_recent`, `latest_message`, `all`, `off` |
 | `TASK_MODEL` | `gemini-3.5-flash-lite` | Model for title/tags/follow-ups; empty = chat model |
@@ -80,7 +82,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 | `IMAGE_ASPECT_RATIO` | `auto` | Aspect ratio for generated images (`1:1` … `21:9`); auto = model default |
 | `IMAGE_SIZE` | `auto` | Size for generated images (`1K`, `2K`, `4K`); auto = model default |
 | `MAPS_LATITUDE` / `MAPS_LONGITUDE` | `""` | Per-user Maps location; empty = use the admin default |
-| `USE_NATIVE_FILES` | `True` | Send audio, video and full-context PDFs to Gemini natively (inline or via the Files API) instead of OpenWebUI's RAG text |
+| `USE_NATIVE_FILES` | `True` | Master switch for native files: audio, video and PDFs (full-context, or forced by the Native PDFs toggle / `NATIVE_PDF_DEFAULT`) go to Gemini natively instead of OpenWebUI's RAG text |
 | `HIDE_BLOCKS` | `[]` | Collapsible blocks to hide (`google_search`, `url_context`, `reasoning`). Progress still shows in the status line; with the search block hidden, Search Suggestions appear as links. The Google Maps attribution is always shown (`google_maps` has no effect) |
 | `SHOW_TOKEN_COUNT` | `Off` | Show context window progress after each response; `With Cache` also shows cached tokens |
 | `SHOW_COST` | `True` | Show the estimated USD cost of the turn in the status line and the message usage |
@@ -103,7 +105,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 
 ## Files and media
 
-- **Native:** audio and video files go to the Gemini API directly, as do images. PDFs go natively when the file is set to full context ("Using Entire Document"); otherwise they stay with OpenWebUI's RAG retrieval, like all other file types.
+- **Native:** audio and video files go to the Gemini API directly, as do images. PDFs go natively when the file is set to full context ("Using Entire Document"), when the Native PDFs toggle is on for the chat, or when `NATIVE_PDF_DEFAULT` is set; otherwise they stay with OpenWebUI's retrieval (and its knowledge tools), like all other file types. A PDF sent natively on an earlier turn stays native on follow-ups.
 - **Inline vs Files API:** files up to `INLINE_FILE_MAX_MB` are inlined into the request; larger ones go through the Files API, whose files are retained by Google for 48 hours. The pipe caches the upload (keyed by key fingerprint, file id and hash) in the file's OpenWebUI metadata, so the same attachment is not re-uploaded on every turn.
 - **YouTube links** are converted to native video input; `YOUTUBE_LINKS` picks which links (`most_recent`, `latest_message`, `all`, `off`). Media anchors stay on the user message where the link appeared, so history replay re-anchors files correctly.
 
@@ -111,7 +113,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 
 - Nano Banana models (e.g. `gemini-nano-banana-2.1`, `gemini-3-pro-image`) generate images from the chat.
 - `IMAGE_ASPECT_RATIO` and `IMAGE_SIZE` are passed through to the API when set; `auto` leaves the model default.
-- Generated images are saved to OpenWebUI storage and re-attached on follow-up, so "make it smaller / change the background" edits work across turns.
+- Generated images are saved to OpenWebUI storage. On a follow-up, the most recent assistant message's images are attached to your new message, so "make it smaller / change the background" edits the picture instead of redrawing it (probed on `gemini-nano-banana-2.1` and `gemini-3-pro-image`). Older images are not re-sent; the status line shows "Attaching the previous image" when one is.
 - **SynthID** watermarks are applied by Google on all generated images, not by the pipe.
 
 ## Costs
@@ -141,6 +143,8 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 - **Live smoke:** `GEMINI_API_KEY=YOUR_API_KEY .venv/bin/python helpers/smoke_live.py --scenario all` (start the command with a space so the key stays out of shell history).
 
 ## Changelog
+
+**v0.1.4** — fix: follow-up image edits ignored the earlier picture on `gemini-nano-banana-2.1` and redrew it from the text; the previous image now rides on your new message (probed to edit on both Nano Banana models). New: Native PDFs toggle (`gemini_pipe_native_pdf_toggle.py`) and `NATIVE_PDF_DEFAULT` valve to send PDFs as whole documents without per-file settings; the `FILES_API` description now says it only controls inline versus upload.
 
 **v0.1.3** — fix: a Maps-only answer showed an empty "Google Search" block, and the queries Google reports for Maps were counted as billed searches in the cost estimate. Both are gone.
 

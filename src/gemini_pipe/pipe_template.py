@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.3
+version: 0.1.4
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,9 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.4
+- Fix: follow-up image edits attach the previous image to the new user message (a model-turn replay was ignored by gemini-nano-banana-2.1)
+- New: Native PDFs toggle filter and NATIVE_PDF_DEFAULT valve; FILES_API description corrected
 v0.1.3
 - Fix: a Maps-only answer no longer shows an empty "Google Search" block, and its queries are not counted as billed searches in the cost estimate
 v0.1.2
@@ -599,6 +602,10 @@ class Pipe:
         FILES_API: Literal["auto", "always", "never"] = Field(
             default="auto",
             description="When to upload media files through the Gemini Files API",
+        )
+        NATIVE_PDF_DEFAULT: bool = Field(
+            default=False,
+            description="Send every attached PDF to Gemini as a whole document, not only those set to 'Using Entire Document' (the Native PDFs toggle does the same for one chat). Needs the user valve USE_NATIVE_FILES",
         )
         YOUTUBE_LINKS: Literal["most_recent", "latest_message", "all", "off"] = Field(
             default="most_recent",
