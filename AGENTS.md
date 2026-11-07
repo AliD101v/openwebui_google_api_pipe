@@ -55,6 +55,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 | `helpers/_testlib.py` | Test fakes: `FakeClient`, `FakeEmitter`, `chunk`, `make_pipe`. |
 | `helpers/test_*.py` | Per-feature checks, all offline against the built artifact. |
 | `helpers/smoke_live.py` | Live smoke scenarios (needs a real key). |
+| `helpers/probe_image_edit.py` | Live probe: which history shape makes an image model edit its earlier image (needs a real key; five image generations per model). |
 | `helpers/probe_tool_combos.py` | Live probe: which built-in/function tool combinations `generateContent` accepts (needs a real key). |
 | `gemini_pipe.py`, `gemini_pipe.min.py` | Generated artifacts (committed; install sources). |
 | `gemini_pipe_web_search_toggle.py`, `gemini_pipe_maps_toggle.py`, `gemini_manifold_companion_filter.py` | Companion filters. |
