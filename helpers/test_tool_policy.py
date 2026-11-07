@@ -126,7 +126,7 @@ def test_maps_with_search_override_restores_the_combination():
     tools, _tool_config, notes = pipe._assemble_tools(info, flags, [])
     assert any(t.google_maps is not None for t in tools)
     assert any(t.google_search is not None for t in tools)
-    assert notes == []
+    assert not any("Google Search disabled" in n for n in notes)
 
 
 def test_maps_excludes_url_context():

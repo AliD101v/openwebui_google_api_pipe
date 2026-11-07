@@ -116,6 +116,12 @@ class _Tools:
                 f"Google Search disabled for this message: {model} cannot combine it with Google Maps"
             )
 
+        if maps and url_context and not info.get("maps_with_url_context"):
+            url_context = url_context_auto = False
+            notes.append(
+                f"URL context disabled for this message: {model} cannot combine it with Google Maps"
+            )
+
         builtins = search or url_context or maps
         if decls and builtins and not info.get("builtin_with_functions"):
             # The URL context that a URL in the user's message pulled in is the

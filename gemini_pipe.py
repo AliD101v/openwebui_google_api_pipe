@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.1
+version: 0.1.2
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,8 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.2
+- Fix: Google Maps is never sent with URL context either (URL context is dropped with a note); a "cannot be combined" 400 now retries once without the lower-priority built-in
 v0.1.1
 - Fix: Google Maps and Google Search are never sent together (the API rejects the pair with a 400); Maps wins and Search is dropped with a note
 v0.1.0
@@ -2631,6 +2633,12 @@ class Pipe:
                 f"Google Search disabled for this message: {model} cannot combine it with Google Maps"
             )
 
+        if maps and url_context and not info.get("maps_with_url_context"):
+            url_context = url_context_auto = False
+            notes.append(
+                f"URL context disabled for this message: {model} cannot combine it with Google Maps"
+            )
+
         builtins = search or url_context or maps
         if decls and builtins and not info.get("builtin_with_functions"):
             # The URL context that a URL in the user's message pulled in is the
@@ -3981,19 +3989,57 @@ class Pipe:
                 return min(float(match.group(1)), cls._RETRY_BACKOFF_CAP)
         return None
 
+    # Built-in tools a "'a' and 'b' cannot be combined" 400 may remove, lowest priority first.
+    # google_maps and function declarations are never dropped.
+    _DROPPABLE_BUILTINS = (("url_context", "URL context"), ("google_search", "Google Search"))
+    _PATTERN_TOOL_PAIR = re.compile(r"'(\w+)' and '(\w+)' cannot be combined")
+
+    def _rejected_builtin(self, e: Exception, config) -> Optional[Tuple[str, str]]:
+        """(tool field, label) to drop after a tool-combination 400, if the
+        error names a droppable built-in that this request carries."""
+        if self._classify_error(e)[0] != "bad_request":
+            return None
+        match = self._PATTERN_TOOL_PAIR.search(f"{getattr(e, 'message', '')} {e}")
+        if not match:
+            return None
+        carried = config.tools or []
+        for field, label in self._DROPPABLE_BUILTINS:
+            if field in match.groups() and any(
+                getattr(t, field, None) is not None for t in carried
+            ):
+                return field, label
+        return None
+
     async def _stream_call_with_retries(
         self, ctx, client, contents, config, call
-    ) -> None:
+    ):
         """One generation call, retrying transient failures and empty
-        responses; everything else is re-raised to the pipe."""
+        responses; everything else is re-raised to the pipe.
+
+        Returns the config the call finally ran with: a rejected tool
+        combination removes the lower-priority built-in once, and the later
+        calls of the turn must not send it again."""
         max_retries = int(getattr(self.valves, "MAX_RETRIES", 0) or 0)
         attempt = 0
         retried_empty = False
+        dropped_builtin = False
         while True:
             checkpoint = ctx.msg.checkpoint()
             try:
                 await self._stream_call(ctx, client, contents, config, call)
             except Exception as e:
+                rejected = None if dropped_builtin else self._rejected_builtin(e, config)
+                if rejected:
+                    field, label = rejected
+                    dropped_builtin = True
+                    kept = [t for t in config.tools if getattr(t, field, None) is None]
+                    config = config.model_copy(update={"tools": kept or None})
+                    ctx.msg.rollback(checkpoint)
+                    self._reset_call(call, ctx)
+                    await ctx.status.activity(
+                        f"Retrying without {label}: Google rejects it together with the other tools…"
+                    )
+                    continue
                 kind, retry_after = self._classify_error(e)
                 if kind not in self._RETRYABLE_KINDS or attempt >= max_retries:
                     raise
@@ -4003,9 +4049,9 @@ class Pipe:
                 )
                 continue
             if not self._is_empty_response(call):
-                return
+                return config
             if retried_empty or attempt >= max_retries:
-                return
+                return config
             retried_empty = True
             attempt += 1
             await self._begin_retry(ctx, call, checkpoint, attempt, max_retries, None)
@@ -4440,6 +4486,8 @@ class Pipe:
             # generateContent rejects google_maps + google_search with a 400 on every model (seen on 3.5+;
             # only the Interactions API documents the pair). Override per model if Google enables it.
             "maps_with_search": False,
+            # Same 400 for google_maps + url_context.
+            "maps_with_url_context": False,
             "functions": not image_out,
             "builtin_with_functions": bool(
                 not image_out
@@ -5141,7 +5189,7 @@ class Pipe:
             call = CallState(index=len(ctx.turn.calls))
             ctx.turn.calls.append(call)
             checkpoint = ctx.msg.checkpoint()
-            await self._stream_call_with_retries(ctx, client, contents, config, call)
+            config = await self._stream_call_with_retries(ctx, client, contents, config, call)
             await self._finalize_call(ctx, call)
             finish_name = (
                 getattr(call.finish_reason, "name", str(call.finish_reason))

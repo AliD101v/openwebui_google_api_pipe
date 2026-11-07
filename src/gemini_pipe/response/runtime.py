@@ -254,19 +254,57 @@ class _Runtime:
                 return min(float(match.group(1)), cls._RETRY_BACKOFF_CAP)
         return None
 
+    # Built-in tools a "'a' and 'b' cannot be combined" 400 may remove, lowest priority first.
+    # google_maps and function declarations are never dropped.
+    _DROPPABLE_BUILTINS = (("url_context", "URL context"), ("google_search", "Google Search"))
+    _PATTERN_TOOL_PAIR = re.compile(r"'(\w+)' and '(\w+)' cannot be combined")
+
+    def _rejected_builtin(self, e: Exception, config) -> Optional[Tuple[str, str]]:
+        """(tool field, label) to drop after a tool-combination 400, if the
+        error names a droppable built-in that this request carries."""
+        if self._classify_error(e)[0] != "bad_request":
+            return None
+        match = self._PATTERN_TOOL_PAIR.search(f"{getattr(e, 'message', '')} {e}")
+        if not match:
+            return None
+        carried = config.tools or []
+        for field, label in self._DROPPABLE_BUILTINS:
+            if field in match.groups() and any(
+                getattr(t, field, None) is not None for t in carried
+            ):
+                return field, label
+        return None
+
     async def _stream_call_with_retries(
         self, ctx, client, contents, config, call
-    ) -> None:
+    ):
         """One generation call, retrying transient failures and empty
-        responses; everything else is re-raised to the pipe."""
+        responses; everything else is re-raised to the pipe.
+
+        Returns the config the call finally ran with: a rejected tool
+        combination removes the lower-priority built-in once, and the later
+        calls of the turn must not send it again."""
         max_retries = int(getattr(self.valves, "MAX_RETRIES", 0) or 0)
         attempt = 0
         retried_empty = False
+        dropped_builtin = False
         while True:
             checkpoint = ctx.msg.checkpoint()
             try:
                 await self._stream_call(ctx, client, contents, config, call)
             except Exception as e:
+                rejected = None if dropped_builtin else self._rejected_builtin(e, config)
+                if rejected:
+                    field, label = rejected
+                    dropped_builtin = True
+                    kept = [t for t in config.tools if getattr(t, field, None) is None]
+                    config = config.model_copy(update={"tools": kept or None})
+                    ctx.msg.rollback(checkpoint)
+                    self._reset_call(call, ctx)
+                    await ctx.status.activity(
+                        f"Retrying without {label}: Google rejects it together with the other tools…"
+                    )
+                    continue
                 kind, retry_after = self._classify_error(e)
                 if kind not in self._RETRYABLE_KINDS or attempt >= max_retries:
                     raise
@@ -276,9 +314,9 @@ class _Runtime:
                 )
                 continue
             if not self._is_empty_response(call):
-                return
+                return config
             if retried_empty or attempt >= max_retries:
-                return
+                return config
             retried_empty = True
             attempt += 1
             await self._begin_retry(ctx, call, checkpoint, attempt, max_retries, None)

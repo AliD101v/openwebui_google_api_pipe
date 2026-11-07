@@ -214,7 +214,7 @@ class _Orchestrator:
             call = CallState(index=len(ctx.turn.calls))
             ctx.turn.calls.append(call)
             checkpoint = ctx.msg.checkpoint()
-            await self._stream_call_with_retries(ctx, client, contents, config, call)
+            config = await self._stream_call_with_retries(ctx, client, contents, config, call)
             await self._finalize_call(ctx, call)
             finish_name = (
                 getattr(call.finish_reason, "name", str(call.finish_reason))

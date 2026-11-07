@@ -180,6 +180,8 @@ class _Models:
             # generateContent rejects google_maps + google_search with a 400 on every model (seen on 3.5+;
             # only the Interactions API documents the pair). Override per model if Google enables it.
             "maps_with_search": False,
+            # Same 400 for google_maps + url_context.
+            "maps_with_url_context": False,
             "functions": not image_out,
             "builtin_with_functions": bool(
                 not image_out

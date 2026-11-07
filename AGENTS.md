@@ -55,6 +55,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 | `helpers/_testlib.py` | Test fakes: `FakeClient`, `FakeEmitter`, `chunk`, `make_pipe`. |
 | `helpers/test_*.py` | Per-feature checks, all offline against the built artifact. |
 | `helpers/smoke_live.py` | Live smoke scenarios (needs a real key). |
+| `helpers/probe_tool_combos.py` | Live probe: which built-in/function tool combinations `generateContent` accepts (needs a real key). |
 | `gemini_pipe.py`, `gemini_pipe.min.py` | Generated artifacts (committed; install sources). |
 | `gemini_pipe_web_search_toggle.py`, `gemini_pipe_maps_toggle.py`, `gemini_manifold_companion_filter.py` | Companion filters. |
 
@@ -68,6 +69,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 - Grounding offsets are **UTF-8 bytes**, not characters.
 - Citation numbering is turn-wide and starts **after** OpenWebUI's RAG sources (`rag_offset`).
 - Search Suggestions **must stay visible** in some form (Google's terms); `SHOW_SEARCH_SUGGESTIONS` changes form, not presence.
+- `google_maps` never shares a request with `google_search` or `url_context` (the API answers 400); capabilities `maps_with_search` / `maps_with_url_context` default to False. A tool-combination 400 retries once without the lower-priority built-in. Google's docs describe combinations for the Interactions API, not `generateContent`: trust `probe_tool_combos.py`, not the docs.
 - Tool approval: a missing or broken approval channel **denies**, never silently allows.
 - Metadata markers **accumulate forward**: each turn appends prior turns' markers to the saved message.
 - Media anchors stay on the **original user message**, so replay re-anchors files correctly.
