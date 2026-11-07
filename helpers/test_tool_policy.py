@@ -98,3 +98,32 @@ def test_resolve_builtin_flags():
     assert with_url["url_context_auto"] is True
     with_youtube = pipe._resolve_builtin_flags({}, pipe.valves, None, info, "watch https://youtube.com/watch?v=abc")
     assert with_youtube["url_context"] is False
+
+
+def test_maps_and_search_are_never_sent_together():
+    # generateContent answers 400 INVALID_ARGUMENT when google_maps and google_search share a request,
+    # even on the newest models: Maps wins and Search is dropped with a note.
+    for model in ("gemini-4-argon", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash"):
+        for valves, metadata in (
+            ({}, {"gemini_web_search": True, "gemini_maps": True}),
+            ({"WEB_SEARCH_DEFAULT": True}, {"gemini_maps": True}),
+        ):
+            pipe = make_pipe(**valves)
+            info = pipe.get_model_info(model)
+            flags = pipe._resolve_builtin_flags(metadata, pipe.valves, None, info, "")
+            tools, _tool_config, notes = pipe._assemble_tools(info, flags, [])
+            assert any(t.google_maps is not None for t in tools), (model, valves)
+            assert all(t.google_search is None for t in tools), (model, valves)
+            assert any("Google Search disabled" in n for n in notes), (model, valves)
+
+
+def test_maps_with_search_override_restores_the_combination():
+    pipe = make_pipe(MODEL_CAPABILITY_OVERRIDES='{"gemini-4*": {"maps_with_search": true}}')
+    info = pipe.get_model_info("gemini-4-argon")
+    flags = pipe._resolve_builtin_flags(
+        {"gemini_web_search": True, "gemini_maps": True}, pipe.valves, None, info, ""
+    )
+    tools, _tool_config, notes = pipe._assemble_tools(info, flags, [])
+    assert any(t.google_maps is not None for t in tools)
+    assert any(t.google_search is not None for t in tools)
+    assert notes == []
