@@ -213,7 +213,8 @@ def test_store_generated_image_paths():
 
 
 def test_generated_image_history_replay(tmp_path):
-    # criterion 4
+    # criterion 4 (changed after probing the live API): the earlier image goes on the NEW user message.
+    # Replayed in a model turn with the dummy signature, gemini-nano-banana-2.1 ignored it and redrew.
     pipe = make_pipe()
     mod = pipe_module(pipe)
     file_id = str(uuid4())
@@ -237,18 +238,25 @@ def test_generated_image_history_replay(tmp_path):
         {"role": "assistant", "content": assistant},
         {"role": "user", "content": "make it bigger"},
     ]
-    ctx = make_ctx(pipe, emitter=FakeEmitter())
+    emitter = FakeEmitter()
+    ctx = make_ctx(pipe, emitter=emitter)
 
     info = pipe.get_model_info("gemini-nano-banana-2.1")
     _system, contents = asyncio.run(pipe._convert_history(messages, info, ctx))
     assert [c.role for c in contents] == ["user", "model", "user"]
-    parts = contents[1].parts
+    assert [p.text for p in contents[1].parts] == ["Here."]
+    assert all(p.inline_data is None for p in contents[1].parts)
+    parts = contents[2].parts
     assert len(parts) == 2
     assert parts[0].inline_data is not None
     assert parts[0].inline_data.mime_type == "image/png"
     assert parts[0].inline_data.data == PNG
-    assert parts[0].thought_signature == mod.DUMMY_THOUGHT_SIGNATURE
-    assert parts[1].text == "Here."
+    assert parts[0].thought_signature is None
+    assert parts[1].text == "make it bigger"
+    assert any(
+        "previous image" in (e["data"].get("description") or "")
+        for e in emitter.of_type("status")
+    )
 
     info = pipe.get_model_info("gemini-4-argon")
     _system, contents = asyncio.run(pipe._convert_history(messages, info, ctx))
@@ -483,3 +491,57 @@ def test_maps_only_grounding_with_queries_renders_no_search_block():
     descriptions = [e["data"].get("description") or "" for e in emitter.of_type("status")]
     assert not any("Searching Google" in d or "Searched" in d for d in descriptions)
     assert any("places" in d for d in descriptions)
+
+
+def _two_image_chat(tmp_path, pipe, first_text="One.", second_text="Two."):
+    mod = pipe_module(pipe)
+    ids = [str(uuid4()), str(uuid4())]
+    datas = [PNG + b"\x01" * 8, PNG + b"\x02" * 8]
+    fake_owui_files(
+        mod,
+        tmp_path,
+        [
+            {
+                "id": fid,
+                "filename": "generated-image.png",
+                "path": f"files/{fid}.png",
+                "hash": f"h{n}",
+                "content_type": "image/png",
+                "data": data,
+            }
+            for n, (fid, data) in enumerate(zip(ids, datas))
+        ],
+    )
+    messages = [
+        {"role": "user", "content": "draw a cat"},
+        {"role": "assistant", "content": f"{first_text}\n![Generated image](/api/v1/files/{ids[0]}/content)"},
+        {"role": "user", "content": "add a hat"},
+        {"role": "assistant", "content": f"{second_text}\n![Generated image](/api/v1/files/{ids[1]}/content)"},
+        {"role": "user", "content": "make the hat red"},
+    ]
+    return messages, datas
+
+
+def test_only_the_latest_generated_image_is_resent(tmp_path):
+    pipe = make_pipe()
+    messages, datas = _two_image_chat(tmp_path, pipe)
+    ctx = make_ctx(pipe, emitter=FakeEmitter())
+    info = pipe.get_model_info("gemini-nano-banana-2.1")
+    _system, contents = asyncio.run(pipe._convert_history(messages, info, ctx))
+    images = [p.inline_data.data for c in contents for p in c.parts if p.inline_data is not None]
+    assert images == [datas[1]]
+    assert contents[-1].role == "user"
+    assert contents[-1].parts[0].inline_data.data == datas[1]
+    assert contents[-1].parts[-1].text == "make the hat red"
+
+
+def test_image_only_assistant_message_still_resends_its_image(tmp_path):
+    pipe = make_pipe()
+    messages, datas = _two_image_chat(tmp_path, pipe, first_text="", second_text="")
+    ctx = make_ctx(pipe, emitter=FakeEmitter())
+    info = pipe.get_model_info("gemini-nano-banana-2.1")
+    _system, contents = asyncio.run(pipe._convert_history(messages, info, ctx))
+    assert all(c.role == "user" for c in contents)
+    images = [p.inline_data.data for c in contents for p in c.parts if p.inline_data is not None]
+    assert images == [datas[1]]
+    assert contents[-1].parts[-1].text == "make the hat red"

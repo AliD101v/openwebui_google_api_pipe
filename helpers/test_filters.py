@@ -59,3 +59,18 @@ def test_companion_filter_routes_web_search():
     asyncio.run(f.inlet(body, __metadata__=metadata))
     assert body == {"model": "gpt-4o", "features": {"web_search": True}}
     assert metadata == {}
+
+
+def test_native_pdf_toggle_sets_metadata_flag():
+    toggle = _load_filter(REPO_ROOT / "gemini_pipe_native_pdf_toggle.py")
+    f = toggle.Filter()
+    assert f.toggle is True
+
+    metadata = {}
+    asyncio.run(f.inlet({}, __metadata__=metadata))
+    assert metadata["gemini_native_pdf"] is True
+
+    body = {}
+    asyncio.run(f.inlet(body, __metadata__=None))
+    assert body["metadata"]["gemini_native_pdf"] is True
+    assert not getattr(f, "file_handler", False)  # OpenWebUI's RAG must still handle the non-native files

@@ -48,7 +48,7 @@ def gemini_file(name="files/abc", mime="video/mp4", state="ACTIVE"):
     )
 
 
-def run_pipe(pipe, fake, *, messages=None, files=None, user=None):
+def run_pipe(pipe, fake, *, messages=None, files=None, user=None, metadata=None):
     """Run pipe() against the fake client and return (result, emitter)."""
     pipe._build_genai_client = lambda api_key, timeout_s=None: fake
     emitter = FakeEmitter()
@@ -58,7 +58,7 @@ def run_pipe(pipe, fake, *, messages=None, files=None, user=None):
             body,
             __user__=user or make_user(pipe),
             __event_emitter__=emitter,
-            __metadata__={"chat_id": "c1", "message_id": "m1"},
+            __metadata__=dict({"chat_id": "c1", "message_id": "m1"}, **(metadata or {})),
             __files__=files,
         )
     )
@@ -374,3 +374,71 @@ def test_native_files_off_keeps_rag(tmp_path):
     assert not any(p.inline_data is not None for p in parts)
     system_instruction = fake.stream_calls[0]["config"].system_instruction or ""
     assert "memo.mp3" in system_instruction
+
+
+def _plain_pdf(tmp_path, pipe):
+    mod = pipe_module(pipe)
+    pdf = b"%PDF-1.4 tiny"
+    fake_owui_files(
+        mod,
+        tmp_path,
+        [
+            {
+                "id": "f9",
+                "filename": "paper.pdf",
+                "path": "files/paper.pdf",
+                "hash": "h9",
+                "content_type": "application/pdf",
+                "data": pdf,
+            }
+        ],
+    )
+    files = [
+        {
+            "type": "file",
+            "id": "f9",
+            "name": "paper.pdf",
+            "file": {"meta": {"content_type": "application/pdf"}},
+        }
+    ]
+    return pdf, files
+
+
+def _inline_pdfs(fake):
+    return [
+        p.inline_data.data
+        for c in user_contents(fake)
+        for p in c.parts
+        if p.inline_data is not None
+    ]
+
+
+def test_native_pdf_toggle_and_valve_send_a_plain_pdf_natively(tmp_path):
+    # A PDF left in retrieval mode (no "Using Entire Document") goes native with the per-chat toggle
+    # (metadata flag) or the admin default, but never when USE_NATIVE_FILES is off.
+    messages = [{"role": "user", "content": "Summarise"}]
+
+    pipe = make_pipe(GEMINI_API_KEY="k")
+    pdf, files = _plain_pdf(tmp_path, pipe)
+    fake = FakeClient(scripts=[answer_script()])
+    run_pipe(pipe, fake, messages=messages, files=files, metadata={"gemini_native_pdf": True})
+    assert _inline_pdfs(fake) == [pdf]
+
+    pipe = make_pipe(GEMINI_API_KEY="k", NATIVE_PDF_DEFAULT=True)
+    pdf, files = _plain_pdf(tmp_path, pipe)
+    fake = FakeClient(scripts=[answer_script()])
+    run_pipe(pipe, fake, messages=messages, files=files)
+    assert _inline_pdfs(fake) == [pdf]
+
+    pipe = make_pipe(GEMINI_API_KEY="k")
+    _pdf, files = _plain_pdf(tmp_path, pipe)
+    fake = FakeClient(scripts=[answer_script()])
+    run_pipe(
+        pipe,
+        fake,
+        messages=messages,
+        files=files,
+        user=make_user(pipe, USE_NATIVE_FILES=False),
+        metadata={"gemini_native_pdf": True},
+    )
+    assert _inline_pdfs(fake) == []
