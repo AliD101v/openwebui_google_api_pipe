@@ -99,6 +99,10 @@ class _Runtime:
         maps_chunks = [c for c in acc.chunks if c.get("kind") == "maps"]
 
         queries = [q for q in acc.queries if q]
+        if maps_chunks and not web_chunks:
+            # Maps responses carry web_search_queries of their own; they are not Search queries
+            # (no Search block or status, and not counted as billed searches).
+            queries = []
         if queries:
             for query in queries:
                 if query not in ctx.turn.search_queries:

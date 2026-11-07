@@ -7,7 +7,7 @@ Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Deve
 
 ## Status
 
-- **Pipe version:** `0.1.2`
+- **Pipe version:** `0.1.3`
 - **Requirements:** `google-genai>=1.68.0`, `pydantic>=2`, `cryptography`
 - **Recommended OpenWebUI:** `0.11.4+`. OpenWebUI 0.11.0–0.11.3 pinned `google-genai==1.66.0`; installing this pipe upgrades that shared package, so check your instance before relying on new SDK behaviour.
 
@@ -141,6 +141,8 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 - **Live smoke:** `GEMINI_API_KEY=YOUR_API_KEY .venv/bin/python helpers/smoke_live.py --scenario all` (start the command with a space so the key stays out of shell history).
 
 ## Changelog
+
+**v0.1.3** — fix: a Maps-only answer showed an empty "Google Search" block, and the queries Google reports for Maps were counted as billed searches in the cost estimate. Both are gone.
 
 **v0.1.2** — fix: the Maps toggle still failed with `400 INVALID_ARGUMENT` because Google also rejects `google_maps` together with `url_context`, which Search switches on by itself. Maps now drops URL context too (with a note), and a "cannot be combined" 400 retries once without the lower-priority built-in (URL context, then Search). `helpers/probe_tool_combos.py` shows what the live API accepts.
 

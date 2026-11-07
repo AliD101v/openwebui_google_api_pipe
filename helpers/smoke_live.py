@@ -103,6 +103,9 @@ def _add_tool(calls):
     }
 
 
+SAVED_IMAGES: list = []
+
+
 async def _store_generated_image_to_smoke_dir(ctx, data, mime):
     """Stand-in for OpenWebUI's file store: write under .smoke_out/ and hand
     back the local path so the image still renders inline."""
@@ -110,6 +113,7 @@ async def _store_generated_image_to_smoke_dir(ctx, data, mime):
     extension = ".png" if "png" in mime else (".jpg" if "jpeg" in mime else ".img")
     path = SMOKE_OUT / f"smoke-image{extension}"
     path.write_bytes(data)
+    SAVED_IMAGES.append(path)
     print(f"  [image saved] {path.name} ({len(data)} bytes)", flush=True)
     return str(path)
 
@@ -125,7 +129,7 @@ def _scenario_ok(scenario, result, emitter, calls):
     if scenario == "tool":
         return calls["n"] >= 1 and bool(result.strip())
     if scenario == "image":
-        return bool(list(SMOKE_OUT.glob("smoke-image-*"))) and "![Generated image]" in result
+        return bool(SAVED_IMAGES) and "![Generated image]" in result
     return False
 
 

@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.2
+version: 0.1.3
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,8 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.3
+- Fix: a Maps-only answer no longer shows an empty "Google Search" block, and its queries are not counted as billed searches in the cost estimate
 v0.1.2
 - Fix: Google Maps is never sent with URL context either (URL context is dropped with a note); a "cannot be combined" 400 now retries once without the lower-priority built-in
 v0.1.1
