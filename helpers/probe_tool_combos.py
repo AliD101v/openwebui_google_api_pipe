@@ -1,6 +1,6 @@
 """Which tool combinations does generateContent accept? Needs a real key.
 
-    GEMINI_API_KEY=... .venv/bin/python helpers/probe_tool_combos.py [--model gemini-3.6-flash ...]
+    GEMINI_API_KEY=YOUR_API_KEY .venv/bin/python helpers/probe_tool_combos.py [--model gemini-3.6-flash ...]
 
 One tiny request per combination ("reply ok"), so the model won't call a tool and the cost is negligible.
 Prints ok or the API's rejection. Without a key it prints "skipped" and exits 0.
@@ -12,6 +12,7 @@ import os
 import sys
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as gtypes
 
 BUILTINS = {
@@ -50,7 +51,10 @@ def build_config(builtins, with_function, mode):
         if "include_server_side_tool_invocations" in gtypes.ToolConfig.model_fields:
             kwargs["include_server_side_tool_invocations"] = True
         tool_config = gtypes.ToolConfig(**kwargs)
-    return gtypes.GenerateContentConfig(tools=tools, tool_config=tool_config, max_output_tokens=64)
+    return gtypes.GenerateContentConfig(
+        tools=tools, tool_config=tool_config, max_output_tokens=64,
+        automatic_function_calling=gtypes.AutomaticFunctionCallingConfig(disable=True),
+    )
 
 
 def main() -> int:
@@ -61,6 +65,9 @@ def main() -> int:
     if not key:
         print("skipped: set GEMINI_API_KEY to probe the live API")
         return 0
+    if not key.isascii():
+        print("error: the API key contains non-ASCII characters (a placeholder such as '…' left in the command?)")
+        return 2
     client = genai.Client(api_key=key, vertexai=False)
     for model in args.model or ["gemini-3.6-flash"]:
         print(f"\n{model}")
@@ -72,9 +79,12 @@ def main() -> int:
                     config=build_config(builtins, with_function, mode),
                 )
                 verdict = "ok"
-            except Exception as e:  # noqa: BLE001 - report every rejection
+            except genai_errors.APIError as e:
                 text = str(getattr(e, "message", "") or e).replace("\n", " ")
                 verdict = "REJECTED: " + text[:160]
+            except Exception as e:  # noqa: BLE001 - not an API verdict (network, key encoding): stop, don't repeat it
+                print(f"error: {type(e).__name__}: {e}")
+                return 1
             print(f"  {label:<36} {verdict}")
     return 0
 

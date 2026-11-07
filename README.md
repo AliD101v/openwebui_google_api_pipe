@@ -2,6 +2,9 @@
 
 Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Developer API key, no OpenAI-compatible proxy): Google Search grounding with citations, thinking display, native function tools, native files and YouTube media, and image generation.
 
+> [!NOTE]
+> The work done in this repository was developed using AI.
+
 ## Status
 
 - **Pipe version:** `0.1.2`
@@ -135,7 +138,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
   .venv/bin/python helpers/build_gemini_pipe.py
   .venv/bin/python -m pytest helpers -q
   ```
-- **Live smoke:** `GEMINI_API_KEY=… .venv/bin/python helpers/smoke_live.py --scenario all` (start the command with a space so the key stays out of shell history).
+- **Live smoke:** `GEMINI_API_KEY=YOUR_API_KEY .venv/bin/python helpers/smoke_live.py --scenario all` (start the command with a space so the key stays out of shell history).
 
 ## Changelog
 

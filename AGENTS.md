@@ -16,7 +16,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 | Fail if committed artifacts are stale | `.venv/bin/python helpers/build_gemini_pipe.py --check` |
 | Pull the artifact back into the template | `.venv/bin/python helpers/build_gemini_pipe.py --refresh-template` |
 | Full test suite (fake client, no network) | `.venv/bin/python -m pytest helpers -q` |
-| Live smoke | `GEMINI_API_KEY=… .venv/bin/python helpers/smoke_live.py --scenario all` |
+| Live smoke | `GEMINI_API_KEY=YOUR_API_KEY .venv/bin/python helpers/smoke_live.py --scenario all` |
 
 ## Build mechanics
 
@@ -69,7 +69,7 @@ One OpenWebUI manifold pipe for the native Gemini Developer API, plus its toggle
 - Grounding offsets are **UTF-8 bytes**, not characters.
 - Citation numbering is turn-wide and starts **after** OpenWebUI's RAG sources (`rag_offset`).
 - Search Suggestions **must stay visible** in some form (Google's terms); `SHOW_SEARCH_SUGGESTIONS` changes form, not presence.
-- `google_maps` never shares a request with `google_search` or `url_context` (the API answers 400); capabilities `maps_with_search` / `maps_with_url_context` default to False. A tool-combination 400 retries once without the lower-priority built-in. Google's docs describe combinations for the Interactions API, not `generateContent`: trust `probe_tool_combos.py`, not the docs.
+- `google_maps` never shares a request with `google_search` or `url_context` (the API answers 400); capabilities `maps_with_search` / `maps_with_url_context` default to False. A tool-combination 400 retries once without the lower-priority built-in. Google's docs describe combinations for the Interactions API, not `generateContent`: trust `probe_tool_combos.py`, not the docs. Probed 2026-11-07 on `gemini-3.6-flash` and `gemini-4-argon`: Maps alone, Search alone, URL context alone and Search+URL context are accepted; Maps+Search and Maps+URL context are rejected (3.6 Flash answers a generic "invalid argument" without naming the tools, so the retry only catches the named variant); built-ins plus function tools are accepted only with `include_server_side_tool_invocations` and mode `VALIDATED`.
 - Tool approval: a missing or broken approval channel **denies**, never silently allows.
 - Metadata markers **accumulate forward**: each turn appends prior turns' markers to the saved message.
 - Media anchors stay on the **original user message**, so replay re-anchors files correctly.

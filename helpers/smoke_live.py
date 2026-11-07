@@ -174,6 +174,9 @@ def main() -> int:
     if not os.environ.get("GEMINI_API_KEY"):
         print("skipped: GEMINI_API_KEY is not set")
         return 0
+    if not os.environ["GEMINI_API_KEY"].isascii():
+        print("error: GEMINI_API_KEY contains non-ASCII characters (a placeholder such as '…' left in the command?)")
+        return 2
 
     module = _load_pipe()
     pipe = module.Pipe()
