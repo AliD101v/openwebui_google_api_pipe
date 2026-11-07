@@ -51,7 +51,7 @@ def text_of(response) -> str:
 
 def grid(data: bytes) -> list:
     img = Image.open(io.BytesIO(data)).convert("L").resize((32, 32))
-    return list(img.getdata())
+    return list(img.tobytes())
 
 
 def difference(a: bytes, b: bytes) -> float:
