@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import py_compile
+import re
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,7 @@ def test_build_produces_valid_artifact():
         py_compile.compile(str(path), doraise=True)
     module = load_pipe_module()
     docstring = module.__doc__ or ""
-    assert "version: 0.1.0" in docstring
+    assert re.search(r"^version: \d+\.\d+\.\d+$", docstring, re.M)
     assert hasattr(module.Pipe, "pipes")
 
 

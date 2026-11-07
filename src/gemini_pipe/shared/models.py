@@ -177,7 +177,9 @@ class _Models:
             "search": not (family == "image" and "flash-lite" in name),
             "url_context": not image_out,
             "maps": not image_out,
-            "maps_with_search": generation >= 3.5,
+            # generateContent rejects google_maps + google_search with a 400 on every model (seen on 3.5+;
+            # only the Interactions API documents the pair). Override per model if Google enables it.
+            "maps_with_search": False,
             "functions": not image_out,
             "builtin_with_functions": bool(
                 not image_out

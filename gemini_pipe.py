@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.0
+version: 0.1.1
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,8 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.1
+- Fix: Google Maps and Google Search are never sent together (the API rejects the pair with a 400); Maps wins and Search is dropped with a note
 v0.1.0
 - Initial release.
 """
@@ -4435,7 +4437,9 @@ class Pipe:
             "search": not (family == "image" and "flash-lite" in name),
             "url_context": not image_out,
             "maps": not image_out,
-            "maps_with_search": generation >= 3.5,
+            # generateContent rejects google_maps + google_search with a 400 on every model (seen on 3.5+;
+            # only the Interactions API documents the pair). Override per model if Google enables it.
+            "maps_with_search": False,
             "functions": not image_out,
             "builtin_with_functions": bool(
                 not image_out

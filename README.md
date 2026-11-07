@@ -4,7 +4,7 @@ Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Deve
 
 ## Status
 
-- **Pipe version:** `0.1.0`
+- **Pipe version:** `0.1.1`
 - **Requirements:** `google-genai>=1.68.0`, `pydantic>=2`, `cryptography`
 - **Recommended OpenWebUI:** `0.11.4+`. OpenWebUI 0.11.0–0.11.3 pinned `google-genai==1.66.0`; installing this pipe upgrades that shared package, so check your instance before relying on new SDK behaviour.
 
@@ -88,6 +88,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 - **Billing:** Gemini 3+ charges $14 per 1,000 search queries after 5,000 free per month; Gemini 2.5 charges per grounded prompt. The pipe's cost estimate counts every search at the list price, so it is an upper bound inside the free allowance.
 - **Search Suggestions** are shown with every grounded answer because Google's terms require them; `SHOW_SEARCH_SUGGESTIONS` only changes the form (embedded block vs plain links).
 - **Redirect URLs are resolved without visiting the target site:** the pipe reads only Google's `grounding-api-redirect` `Location` header, then stops.
+- **Maps and Search are exclusive per request:** `generateContent` rejects `google_maps` together with `google_search` (400 `INVALID_ARGUMENT`). With both on, Maps wins and Search is dropped for that message, with a note. If Google enables the pair for a model, restore it with `MODEL_CAPABILITY_OVERRIDES`, e.g. `{"gemini-4*": {"maps_with_search": true}}`.
 - **Combining with function tools:** Gemini 3+ can combine built-in tools with function tools (Google labels it preview); on Gemini 2.5 it cannot, and `BUILTIN_TOOL_CONFLICT` decides which side is dropped.
 
 ## Tools
@@ -137,6 +138,8 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 - **Live smoke:** `GEMINI_API_KEY=… .venv/bin/python helpers/smoke_live.py --scenario all` (start the command with a space so the key stays out of shell history).
 
 ## Changelog
+
+**v0.1.1** — fix: the Maps toggle failed with `400 INVALID_ARGUMENT` whenever Google Search was also on (by toggle, `WEB_SEARCH_DEFAULT` or OpenWebUI's web search button). `generateContent` rejects the pair on every model, so Maps now wins and Search is dropped for that message with a note.
 
 **v0.1.0** — initial release:
 
