@@ -11,6 +11,8 @@ import sys
 from types import SimpleNamespace
 from uuid import uuid4
 
+from google.genai import errors as genai_errors
+
 from _testlib import (
     REPO_ROOT,
     FakeClient,
@@ -367,3 +369,75 @@ def test_smoke_script_scenarios_offline():
         )
         assert proc.returncode == 0, (scenario, proc.stdout, proc.stderr)
         assert "skipped" in (proc.stdout + proc.stderr), (scenario, proc.stdout)
+
+
+def _text_script(text):
+    return [
+        chunk(
+            {
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": text}]},
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+            }
+        )
+    ]
+
+
+def test_maps_request_carries_only_the_maps_tool():
+    # The reported failure: Maps toggle with Search on by default (and a URL in the message) sent
+    # google_maps next to google_search/url_context and the API answered 400.
+    pipe = make_pipe(GEMINI_API_KEY="k", WEB_SEARCH_DEFAULT=True, RESOLVE_GROUNDING_URLS=False)
+    fake = FakeClient(scripts=[_text_script("Try Café Einstein.")])
+    run_pipe(
+        pipe,
+        fake,
+        model="gemini-4-argon",
+        messages=[{"role": "user", "content": "a café near https://example.com/berlin please"}],
+        metadata={"chat_id": "c1", "message_id": "m1", "gemini_maps": True},
+    )
+    tools = fake.stream_calls[0]["config"].tools or []
+    assert [bool(t.google_maps) for t in tools] == [True]
+    assert all(t.google_search is None and t.url_context is None for t in tools)
+
+
+def test_rejected_builtin_combination_is_retried_without_the_lower_priority_tool():
+    # An unknown combination 400 ("'a' and 'b' cannot be combined") drops the lower-priority built-in
+    # (url_context before google_search; google_maps is never dropped) and retries once.
+    pipe = make_pipe(
+        GEMINI_API_KEY="k",
+        URL_CONTEXT="always",
+        RESOLVE_GROUNDING_URLS=False,
+        MODEL_CAPABILITY_OVERRIDES='{"gemini-4*": {"maps_with_url_context": true}}',
+    )
+    error = genai_errors.ClientError(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "'google_maps' and 'url_context' cannot be combined in the same request. Please choose one to continue.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+    fake = FakeClient(scripts=[[error], _text_script("Try Café Einstein.")])
+    result, emitter = run_pipe(
+        pipe,
+        fake,
+        model="gemini-4-argon",
+        metadata={"chat_id": "c1", "message_id": "m1", "gemini_maps": True},
+    )
+    assert len(fake.stream_calls) == 2
+    first, second = (c["config"].tools or [] for c in fake.stream_calls)
+    assert any(t.url_context is not None for t in first)
+    assert any(t.google_maps is not None for t in second)
+    assert all(t.url_context is None for t in second)
+    assert "Try Café Einstein." in result
+    assert not emitter.of_type("notification")
+    assert any(
+        "without URL context" in (e["data"].get("description") or "")
+        for e in emitter.of_type("status")
+    )

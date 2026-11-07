@@ -127,3 +127,34 @@ def test_maps_with_search_override_restores_the_combination():
     assert any(t.google_maps is not None for t in tools)
     assert any(t.google_search is not None for t in tools)
     assert notes == []
+
+
+def test_maps_excludes_url_context():
+    # generateContent also answers 400 for google_maps + url_context. URL context is switched on by Search
+    # ("auto"/"with_search"), by "always", or by a URL in the message; with Maps on, none of them may reach the request.
+    cases = (
+        ({}, {"gemini_web_search": True, "gemini_maps": True}, ""),
+        ({"WEB_SEARCH_DEFAULT": True}, {"gemini_maps": True}, ""),
+        ({"URL_CONTEXT": "always"}, {"gemini_maps": True}, ""),
+        ({}, {"gemini_maps": True}, "is https://example.com/cafes any good?"),
+    )
+    for model in ("gemini-4-argon", "gemini-3.8-flash", "gemini-2.5-flash"):
+        for valves, metadata, text in cases:
+            pipe = make_pipe(**valves)
+            info = pipe.get_model_info(model)
+            flags = pipe._resolve_builtin_flags(metadata, pipe.valves, None, info, text)
+            tools, _tool_config, notes = pipe._assemble_tools(info, flags, [])
+            assert any(t.google_maps is not None for t in tools), (model, valves, text)
+            assert all(t.google_search is None for t in tools), (model, valves, text)
+            assert all(t.url_context is None for t in tools), (model, valves, text)
+            assert any("URL context disabled" in n for n in notes), (model, valves, text)
+
+
+def test_maps_with_url_context_override_restores_the_combination():
+    pipe = make_pipe(MODEL_CAPABILITY_OVERRIDES='{"gemini-4*": {"maps_with_url_context": true}}')
+    info = pipe.get_model_info("gemini-4-argon")
+    flags = pipe._resolve_builtin_flags({"gemini_maps": True}, pipe.valves, None, info, "see https://example.com")
+    tools, _tool_config, notes = pipe._assemble_tools(info, flags, [])
+    assert any(t.google_maps is not None for t in tools)
+    assert any(t.url_context is not None for t in tools)
+    assert notes == []
