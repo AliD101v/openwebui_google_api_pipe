@@ -1,6 +1,6 @@
 # Google Gemini API Manifold Pipe for Open WebUI
 
-Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Developer API key, no OpenAI-compatible proxy): Google Search and Maps grounding with citations, thinking display, native function tools, native PDF input, and image generation.
+Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Developer API key, no OpenAI-compatible proxy): Google Search and Maps grounding with citations, thinking display, native function tools, native PDF and YouTube input, and image generation.
 
 > [!NOTE]
 > The work done in this repository was developed using AI.
@@ -13,7 +13,7 @@ Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Deve
 
 ## Why a native pipe
 
-OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search grounding, inline citations, or native tools. This pipe uses the `google-genai` SDK directly, so these native capabilities are available: search/Maps grounding with the attribution blocks Google's terms require, thought summaries, function calling with thought signatures, native PDF input, and image output.
+OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search grounding, inline citations, or native tools. This pipe uses the `google-genai` SDK directly, so these native capabilities are available: search/Maps grounding with the attribution blocks Google's terms require, thought summaries, function calling with thought signatures, native PDF, YouTube and large-file input, and image output.
 
 ## Features
 
@@ -24,7 +24,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 | Maps | Per-message toggle, location from the user/admin valves, place citations and the required "Google Maps" attribution |
 | Thinking | Thought summaries in collapsible blocks |
 | Tools | OpenWebUI and built-in tools as Gemini functions (together with Search on Gemini 3+); multi-call loop; thought signatures preserved; history replay |
-| PDFs | Sent to Gemini natively as whole documents: per file ("Using Entire Document"), per chat (toggle), or by admin default |
+| Files | PDFs sent to Gemini natively as whole documents: per file ("Using Entire Document"), per chat (toggle), or by admin default; YouTube links as video; files over the inline limit go through the Files API with an upload cache |
 | Image generation | Nano Banana models; images saved to OpenWebUI storage; follow-up edits |
 | Usage and cost | Cost estimate in the status line from dated price tables |
 | Privacy and security | Admin API key encrypted at rest; no chat content in logs |
@@ -59,7 +59,10 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 | `MAX_RETRIES` | `3` | Maximum number of retries for failed requests |
 | `REQUEST_TIMEOUT` | `600` | Request timeout in seconds for Gemini API calls |
 | `TOOL_CALL_TIMEOUT` | `60` | Timeout in seconds for individual tool call execution |
+| `FILES_API` | `auto` | How a file that is already going to Gemini natively is delivered, not whether it goes native. `auto`: inline in the request when it fits `INLINE_FILE_MAX_MB` (and the 90 MB request total), otherwise uploaded through Google's Files API; `always`: always upload; `never`: always inline, and files too large to inline are skipped with a notice |
 | `NATIVE_PDF_DEFAULT` | `False` | Send every attached PDF natively, not only those set to "Using Entire Document"; the Native PDFs toggle does the same for one chat |
+| `INLINE_FILE_MAX_MB` | `20` | Maximum file size in MB to inline instead of using the Files API |
+| `YOUTUBE_LINKS` | `most_recent` | Which YouTube links from the conversation to send to the model: `most_recent`, `latest_message`, `all`, `off` |
 | `TASK_MODEL` | `gemini-3.5-flash-lite` | Model for title/tags/follow-ups; empty = chat model |
 | `MODEL_PRICING_OVERRIDES` | `""` | JSON `{model pattern: {rate key: USD per million tokens}}` overriding the built-in price table, e.g. `{"gemini-2.5*": {"input": 0.20}}` |
 
@@ -90,9 +93,11 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 - OpenWebUI functions and built-in tools are sent as Gemini **native function declarations**; the multi-call loop replays results until the model stops calling.
 - **Thought signatures** on function-call parts are preserved on replay, so the API's signature checks keep passing across calls.
 
-## PDFs
+## Files and media
 
-PDFs go to Gemini natively when the file is set to full context ("Using Entire Document"), when the Native PDFs toggle is on for the chat, or when `NATIVE_PDF_DEFAULT` is set. Otherwise they stay with OpenWebUI's retrieval (and its knowledge tools), like all other file types.
+- **PDFs** go to Gemini natively when the file is set to full context ("Using Entire Document"), when the Native PDFs toggle is on for the chat, or when `NATIVE_PDF_DEFAULT` is set. Otherwise they stay with OpenWebUI's retrieval (and its knowledge tools), like all other file types.
+- **Inline vs Files API:** files up to `INLINE_FILE_MAX_MB` are inlined into the request; larger ones go through the Files API, whose files are retained by Google for 48 hours. The pipe caches the upload (keyed by key fingerprint, file id and hash) in the file's OpenWebUI metadata, so the same attachment is not re-uploaded on every turn.
+- **YouTube links** are converted to native video input; `YOUTUBE_LINKS` picks which links (`most_recent`, `latest_message`, `all`, `off`). Media anchors stay on the user message where the link appeared, so history replay re-anchors files correctly.
 
 ## Image generation
 
@@ -142,7 +147,7 @@ PDFs go to Gemini natively when the file is set to full context ("Using Entire D
 - Google Maps grounding with place citations and attribution; per-message toggle
 - Thought summaries in collapsible blocks
 - Native function calling for OpenWebUI and built-in tools: multi-call loop, thought signatures
-- Native PDF input
+- Native PDF input, YouTube links as video, and large files through the Files API with an upload cache
 - Image generation on Nano Banana models with saved outputs
 - Cost estimate from dated price tables (status line, `cost_usd`)
 - Encrypted API key storage, no chat content in logs
