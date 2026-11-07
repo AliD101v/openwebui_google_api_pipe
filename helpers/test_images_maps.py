@@ -441,3 +441,45 @@ def test_rejected_builtin_combination_is_retried_without_the_lower_priority_tool
         "without URL context" in (e["data"].get("description") or "")
         for e in emitter.of_type("status")
     )
+
+
+def test_maps_only_grounding_with_queries_renders_no_search_block():
+    # The live API reports webSearchQueries on a Maps-only response. They belong to Maps: no "Google Search"
+    # block or status, and no search-query count (cost) for a request that never enabled Search.
+    pipe = make_pipe(GEMINI_API_KEY="k", RESOLVE_GROUNDING_URLS=False)
+    grounding = {
+        "groundingChunks": [
+            {"maps": {"uri": "https://maps.google.com/?cid=1", "title": "Café Einstein", "placeId": "place1"}}
+        ],
+        "groundingSupports": [
+            {
+                "segment": {"startIndex": 4, "endIndex": 19, "text": "Café Einstein."},
+                "groundingChunkIndices": [0],
+            }
+        ],
+        "webSearchQueries": ["café near me"],
+    }
+    script = [
+        chunk({"candidates": [{"content": {"role": "model", "parts": [{"text": "Try Café Einstein."}]}}]}),
+        chunk(
+            {
+                "candidates": [
+                    {"content": {"role": "model", "parts": []}, "finishReason": "STOP", "groundingMetadata": grounding}
+                ],
+                "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+            }
+        ),
+    ]
+    fake = FakeClient(scripts=[script])
+    result, emitter = run_pipe(
+        pipe,
+        fake,
+        model="gemini-4-argon",
+        metadata={"chat_id": "c1", "message_id": "m1", "gemini_maps": True},
+    )
+    assert "Einstein.[1]" in result
+    assert "Google Maps" in result
+    assert 'name="google_search"' not in result
+    descriptions = [e["data"].get("description") or "" for e in emitter.of_type("status")]
+    assert not any("Searching Google" in d or "Searched" in d for d in descriptions)
+    assert any("places" in d for d in descriptions)
