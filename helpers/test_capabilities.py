@@ -23,6 +23,37 @@ def test_gen4_capabilities():
     assert info["builtin_with_functions"] is True
 
 
+def test_hydrogen_and_carbon_capabilities():
+    # Google's thinking page: Hydrogen takes low..xhigh (default high, rejects
+    # minimal); Carbon takes low..high (default medium). Both: 1M context,
+    # text out, Search / Maps / URL context / function calling.
+    pipe = make_pipe()
+    hydrogen = pipe.get_model_info("gemini-4-hydrogen")
+    carbon = pipe.get_model_info("gemini-4-carbon")
+    assert hydrogen["thinking_levels"] == ["low", "medium", "high", "xhigh"]
+    assert carbon["thinking_levels"] == ["low", "medium", "high"]
+    for info in (hydrogen, carbon):
+        assert info["generation"] == 4.0
+        assert info["thinking"] == "level"
+        assert "minimal" not in info["thinking_levels"]
+        assert info["thinking_can_disable"] is False
+        assert info["budget_range"] is None
+        assert info["image_out"] is False
+        assert info["functions"] is True
+        assert info["builtin_with_functions"] is True
+        assert info["search"] and info["url_context"] and info["maps"]
+        assert info["maps_with_search"] is False
+        assert info["maps_with_url_context"] is False
+        assert info["context_length"] == 1048576
+        assert info["max_output"] == 65536
+    assert pipe.get_model_info("gemini-4-argon")["thinking_levels"] == ["low", "medium", "high"]
+
+
+def test_hydrogen_levels_can_still_be_overridden():
+    pipe = make_pipe(MODEL_CAPABILITY_OVERRIDES='{"gemini-4-hydrogen": {"thinking_levels": ["low", "high"]}}')
+    assert pipe.get_model_info("gemini-4-hydrogen")["thinking_levels"] == ["low", "high"]
+
+
 def test_minimal_level_and_budget_models():
     # criterion 13
     pipe = make_pipe()

@@ -9,7 +9,9 @@ import pytest
 from _testlib import FakeClient, fake_model, make_pipe
 
 DISCOVERED = [
+    fake_model("gemini-4-carbon"),
     fake_model("gemini-4-argon"),
+    fake_model("gemini-4-hydrogen"),
     fake_model("gemini-3.8-flash"),
     fake_model("text-embedding-004", supported_actions=("embedContent",)),
     fake_model("gemini-2.0-flash"),
@@ -20,14 +22,18 @@ DISCOVERED = [
 ]
 
 EXPECTED_IDS = [
+    "gemini/gemini-4-carbon",
     "gemini/gemini-4-argon",
+    "gemini/gemini-4-hydrogen",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-nano-banana-2.1",
     "gemini/gemini-2.5-pro",
 ]
 
 STATIC_FALLBACK_IDS = [
+    "gemini/gemini-4-carbon",
     "gemini/gemini-4-argon",
+    "gemini/gemini-4-hydrogen",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.6-flash",
     "gemini/gemini-3.5-flash-lite",

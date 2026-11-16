@@ -43,6 +43,47 @@ def test_call_cost_argon_mixed_tokens():
     assert abs(cost - (0.5 * 2 + 0.5 * 0.10 + 0.2 * 10)) < 1e-9
 
 
+def test_rates_hydrogen_flat_and_carbon_scheduled_rise():
+    # Pricing page (read 2026-11-16): Hydrogen $1.50 / $7.50, cache $0.075, no
+    # long-context tier. Carbon $2 / $10, cache $0.10 through 2026-11-30, then
+    # $4 / $20, cache $0.20 from 2026-12-01.
+    prices = pricing()
+    for day in (date(2026, 11, 16), date(2027, 6, 1)):
+        rates = prices.rates_for("gemini-4-hydrogen", day)
+        assert (rates["input"], rates["output"], rates["cache_read"]) == (1.5, 7.5, 0.075)
+        assert "long_threshold" not in rates and "image_output" not in rates
+    before = prices.rates_for("gemini-4-carbon", date(2026, 11, 30))
+    assert (before["input"], before["output"], before["cache_read"]) == (2.0, 10.0, 0.10)
+    after = prices.rates_for("gemini-4-carbon", date(2026, 12, 1))
+    assert (after["input"], after["output"], after["cache_read"]) == (4.0, 20.0, 0.20)
+    assert prices.rates_for("gemini-4-hydrogen-001", date(2026, 11, 16))["input"] == 1.5
+    assert prices.rates_for("gemini-4-carbon-001", date(2026, 11, 16))["input"] == 2.0
+
+
+def test_call_cost_hydrogen_and_carbon():
+    prices = pricing()
+    long_prompt = {
+        "prompt_token_count": 900_000,
+        "cached_content_token_count": 400_000,
+        "candidates_token_count": 50_000,
+        "thoughts_token_count": 50_000,
+    }
+    rates = prices.rates_for("gemini-4-hydrogen", date(2026, 11, 16))
+    # flat across the whole 1M window: no long-context surcharge
+    assert abs(prices.call_cost(rates, long_prompt) - (500_000 * 1.5 + 400_000 * 0.075 + 100_000 * 7.5) / 1e6) < 1e-9
+
+    usage = {
+        "prompt_token_count": 1_000_000,
+        "cached_content_token_count": 500_000,
+        "candidates_token_count": 100_000,
+        "thoughts_token_count": 100_000,
+    }
+    intro = prices.rates_for("gemini-4-carbon", date(2026, 11, 16))
+    assert abs(prices.call_cost(intro, usage) - (0.5 * 2 + 0.5 * 0.10 + 0.2 * 10)) < 1e-9
+    standard = prices.rates_for("gemini-4-carbon", date(2026, 12, 1))
+    assert abs(prices.call_cost(standard, usage) - (0.5 * 4 + 0.5 * 0.20 + 0.2 * 20)) < 1e-9
+
+
 def test_call_cost_image_output_and_long_context():
     # criterion 3
     prices = pricing()

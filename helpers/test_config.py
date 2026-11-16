@@ -64,6 +64,82 @@ def test_thinking_matrix():
     assert config is None
 
 
+def _level_name(config):
+    """The level as an upper-case name, whichever way the SDK models xhigh."""
+    return str(getattr(config.thinking_level, "value", config.thinking_level)).upper()
+
+
+def test_hydrogen_thinking_levels():
+    # Hydrogen: low/medium/high/xhigh, default high, rejects minimal.
+    pipe = make_pipe()
+    hydrogen = pipe.get_model_info("gemini-4-hydrogen")
+    for effort, expected in (
+        ("xhigh", "XHIGH"),
+        ("max", "XHIGH"),
+        ("high", "HIGH"),
+        ("medium", "MEDIUM"),
+        ("low", "LOW"),
+        ("minimal", "LOW"),
+        ("none", "LOW"),
+    ):
+        config = pipe._build_thinking_config(
+            hydrogen, _user_valves(pipe), {"reasoning_effort": effort}, "chat"
+        )
+        _assert_single_mode(config)
+        assert _level_name(config) == expected, effort
+        assert config.include_thoughts is True
+
+    config = pipe._build_thinking_config(hydrogen, _user_valves(pipe, THINKING_LEVEL="xhigh"), {}, "chat")
+    assert _level_name(config) == "XHIGH"
+    assert config.model_dump(mode="json", exclude_none=True)["thinking_level"].upper() == "XHIGH"
+
+    # auto sends no level, so the model default applies
+    config = pipe._build_thinking_config(hydrogen, _user_valves(pipe), {}, "chat")
+    assert config.thinking_level is None
+
+    # background tasks use the lowest allowed level, never the rejected "minimal"
+    config = pipe._build_thinking_config(hydrogen, _user_valves(pipe), {}, "task")
+    assert _level_name(config) == "LOW"
+    assert config.include_thoughts is False
+
+
+def test_carbon_thinking_levels():
+    # Carbon: low/medium/high, default medium; xhigh and minimal clamp inward.
+    pipe = make_pipe()
+    carbon = pipe.get_model_info("gemini-4-carbon")
+    for effort, expected in (("xhigh", "HIGH"), ("high", "HIGH"), ("medium", "MEDIUM"), ("minimal", "LOW")):
+        config = pipe._build_thinking_config(
+            carbon, _user_valves(pipe), {"reasoning_effort": effort}, "chat"
+        )
+        _assert_single_mode(config)
+        assert _level_name(config) == expected, effort
+    config = pipe._build_thinking_config(carbon, _user_valves(pipe), {}, "chat")
+    assert config.thinking_level is None
+    config = pipe._build_thinking_config(carbon, _user_valves(pipe), {}, "task")
+    assert _level_name(config) == "LOW"
+
+
+def test_xhigh_degrades_to_high_when_the_sdk_cannot_express_it(monkeypatch):
+    # Older google-genai releases have no XHIGH member and reject the lookup;
+    # the call must still go out, one level down.
+    import enum
+    import sys
+    import types
+
+    class OldLevel(enum.Enum):
+        MINIMAL = "MINIMAL"
+        LOW = "LOW"
+        MEDIUM = "MEDIUM"
+        HIGH = "HIGH"
+
+    pipe = make_pipe()
+    module = sys.modules[type(pipe).__module__]
+    monkeypatch.setattr(module, "gtypes", types.SimpleNamespace(ThinkingLevel=OldLevel))
+    assert pipe._thinking_level_member("xhigh") is OldLevel.HIGH
+    assert pipe._thinking_level_member("medium") is OldLevel.MEDIUM
+    assert pipe._thinking_level_member("minimal") is OldLevel.MINIMAL
+
+
 def test_build_generate_config():
     # criterion 17
     pipe = make_pipe()
