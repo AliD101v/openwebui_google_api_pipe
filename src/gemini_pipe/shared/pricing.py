@@ -7,7 +7,8 @@ guessing whenever a model has no known rates.
 """
 from __future__ import annotations
 
-# USD per 1M tokens, read from Google's published Gemini pricing on 2026-11-05.
+# USD per 1M tokens, read from Google's published Gemini pricing on 2026-11-05
+# (Gemini 4 Carbon and Hydrogen on 2026-11-16).
 #
 # GEMINI_PRICES maps a model pattern to the list of dated tiers for it. A
 # pattern ending in * is a prefix match; anything else must match exactly.
@@ -29,6 +30,18 @@ _ARGON_TIERS = [
     {"from": "2026-12-01", "input": 4.00, "output": 20.00, "cache_read": 0.20},
 ]
 
+# Gemini 4 Carbon (read 2026-11-16): introductory $2 / $10 / $0.10 through
+# 2026-11-30, then $4 / $20 / $0.20 from 2026-12-01, the same schedule as
+# Argon. No long-context tier; implicit caching only. Kept as its own name so
+# the two can diverge without touching each other.
+_CARBON_TIERS = _ARGON_TIERS
+
+# Gemini 4 Hydrogen (read 2026-11-16): flat $1.50 / $7.50 / $0.075 with no
+# introductory window, no long-context tier and no scheduled change.
+_HYDROGEN_TIERS = [
+    {"from": "2026-01-01", "input": 1.50, "output": 7.50, "cache_read": 0.075},
+]
+
 _FLASH_3X_TIERS = [
     {"from": "2026-01-01", "input": 0.75, "output": 3.75, "cache_read": 0.075},
     {"from": "2027-01-01", "input": 1.50, "output": 7.50, "cache_read": 0.15},
@@ -47,6 +60,10 @@ def _single_tier(from_date, input_rate, output_rate, cache_rate, **extra):
 
 
 GEMINI_PRICES: dict = {
+    "gemini-4-carbon": _CARBON_TIERS,
+    "gemini-4-carbon*": _CARBON_TIERS,
+    "gemini-4-hydrogen": _HYDROGEN_TIERS,
+    "gemini-4-hydrogen*": _HYDROGEN_TIERS,
     "gemini-4-argon": _ARGON_TIERS,
     "gemini-4-argon*": _ARGON_TIERS,
     "gemini-3.8-flash": _FLASH_3X_TIERS,

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class _Config:
-    _LEVEL_ORDER = ("minimal", "low", "medium", "high")
+    _LEVEL_ORDER = ("minimal", "low", "medium", "high", "xhigh")
     _EFFORT_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
 
     @classmethod
@@ -24,14 +24,39 @@ class _Config:
         rank = {name: i for i, name in enumerate(cls._LEVEL_ORDER)}
         e = str(effort or "auto").lower()
         if e in ("none", "minimal"):
-            target = 0
-        elif e in ("xhigh", "max", "ultra"):
-            target = len(cls._LEVEL_ORDER)
+            target = rank["minimal"]
+        elif e in ("max", "ultra"):
+            target = rank["xhigh"]
         elif e in rank:
             target = rank[e]
         else:
             return max(allowed, key=lambda level: rank[level])
         return min(allowed, key=lambda level: (abs(rank[level] - target), -rank[level]))
+
+    @classmethod
+    def _thinking_level_member(cls, level: str):
+        """The SDK ``ThinkingLevel`` for ``level``.
+
+        google-genai releases before 3.x have no XHIGH member. Their
+        case-insensitive enum mints one on lookup (with a warning) or raises;
+        when it raises, the level degrades to the nearest lower one the SDK
+        has, so the call still goes out.
+        """
+        order = cls._LEVEL_ORDER
+        members = gtypes.ThinkingLevel.__members__
+        member = members.get(level.upper())
+        if member is not None:
+            return member
+        try:
+            return gtypes.ThinkingLevel(level)
+        except (ValueError, KeyError):
+            pass
+        start = order.index(level) if level in order else len(order)
+        for lower in reversed(order[:start]):
+            member = members.get(lower.upper())
+            if member is not None:
+                return member
+        return members["LOW"]
 
     def _build_thinking_config(
         self, info: dict, user_valves, body: dict, purpose: str = "chat"
@@ -58,14 +83,14 @@ class _Config:
             if task:
                 level = self._clamp_level(info.get("thinking_levels"), "minimal")
                 return gtypes.ThinkingConfig(
-                    thinking_level=gtypes.ThinkingLevel[level.upper()],
+                    thinking_level=self._thinking_level_member(level),
                     include_thoughts=False,
                 )
             if not effort or effort == "auto":
                 return gtypes.ThinkingConfig(include_thoughts=show)
             level = self._clamp_level(info.get("thinking_levels"), effort)
             return gtypes.ThinkingConfig(
-                thinking_level=gtypes.ThinkingLevel[level.upper()],
+                thinking_level=self._thinking_level_member(level),
                 include_thoughts=show,
             )
 

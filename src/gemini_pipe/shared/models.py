@@ -36,7 +36,9 @@ class _Models:
     # Served when live discovery fails with no usable cache and the endpoint
     # returned no models: the chat models a default install can expect.
     _STATIC_FALLBACK_MODELS = (
+        "gemini-4-carbon",
         "gemini-4-argon",
+        "gemini-4-hydrogen",
         "gemini-3.8-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",

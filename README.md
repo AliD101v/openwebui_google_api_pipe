@@ -7,7 +7,7 @@ Open WebUI manifold pipe that talks to the **native Gemini Developer API** (Deve
 
 ## Status
 
-- **Pipe version:** `0.1.4`
+- **Pipe version:** `0.1.5`
 - **Requirements:** `google-genai>=1.68.0`, `pydantic>=2`, `cryptography`
 - **Recommended OpenWebUI:** `0.11.4+`. OpenWebUI 0.11.0–0.11.3 pinned `google-genai==1.66.0`; installing this pipe upgrades that shared package, so check your instance before relying on new SDK behaviour.
 
@@ -70,7 +70,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 
 | Name | Default | Description |
 |---|---|---|
-| `THINKING_LEVEL` | `auto` | Thinking level for models that use levels; auto follows the model default |
+| `THINKING_LEVEL` | `auto` | Thinking level for models that use levels; auto follows the model default. `xhigh` is Gemini 4 Hydrogen only (other models use `high`) |
 | `SHOW_THOUGHTS` | `True` | Render the model's reasoning blocks in the chat |
 | `IMAGE_ASPECT_RATIO` | `auto` | Aspect ratio for generated images (`1:1` … `21:9`); auto = model default |
 | `IMAGE_SIZE` | `auto` | Size for generated images (`1K`, `2K`, `4K`); auto = model default |
@@ -108,7 +108,7 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 ## Costs
 
 - The `💵 ≈$…` figure in the status line and the `cost_usd` usage field are **estimates only**, computed from the published list prices in the pipe.
-- The price table was read from Google's pricing page on **2026-11-05**. Scheduled increases already in the table: `gemini-4-argon` rises on 2026-12-01, and `gemini-3.8-flash` / `gemini-3.6-flash` on 2027-01-01. Newer price changes need a table update (or `MODEL_PRICING_OVERRIDES`).
+- The price table was read from Google's pricing page on **2026-11-05** (`gemini-4-carbon` and `gemini-4-hydrogen` on **2026-11-16**). Scheduled increases already in the table: `gemini-4-argon` and `gemini-4-carbon` rise on 2026-12-01, and `gemini-3.8-flash` / `gemini-3.6-flash` on 2027-01-01. `gemini-4-hydrogen` is flat $1.50 / $7.50 per 1M tokens. Newer price changes need a table update (or `MODEL_PRICING_OVERRIDES`).
 - **Free allowances are not subtracted** (e.g. the 5,000 free search queries per month on Gemini 3+), so the estimate is an upper bound.
 - Models without a table entry show no cost at all, never a guess.
 
@@ -131,6 +131,8 @@ OpenWebUI's OpenAI-compatible Gemini connection cannot do Google Search groundin
 - **Live probes:** `helpers/probe_tool_combos.py` and `helpers/probe_image_edit.py` show which tool combinations and history shapes the API accepts for your key and models.
 
 ## Changelog
+
+**v0.1.5** — new: Gemini 4 Hydrogen and Gemini 4 Carbon. Hydrogen thinks at `low`/`medium`/`high`/`xhigh` (default `high`, `minimal` is rejected by the API, so it maps to `low`); Carbon at `low`/`medium`/`high` (default `medium`). Cost estimates: Hydrogen $1.50 / $7.50 per 1M tokens (cached input $0.075); Carbon $2 / $10 (cached $0.10) through 2026-11-30, then $4 / $20 (cached $0.20); neither has a long-context tier. `THINKING_LEVEL` accepts `xhigh`; on a google-genai release without that level it falls back to `high`.
 
 **v0.1.4** — fix: follow-up image edits ignored the earlier picture on `gemini-nano-banana-2.1` and redrew it from the text; the previous image now rides on your new message (probed to edit on both Nano Banana models). New: Native PDFs toggle (`gemini_pipe_native_pdf_toggle.py`) and `NATIVE_PDF_DEFAULT` valve to send PDFs as whole documents without per-file settings.
 

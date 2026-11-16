@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.4
+version: 0.1.5
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,9 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.5
+- New: Gemini 4 Hydrogen and Gemini 4 Carbon. Hydrogen thinks at low/medium/high/xhigh (default high, no minimal); Carbon at low/medium/high (default medium). Cost: Hydrogen $1.50 / $7.50 per 1M tokens (cache $0.075), Carbon $2 / $10 (cache $0.10) through 2026-11-30 and $4 / $20 (cache $0.20) from 2026-12-01; neither has a long-context tier
+- New: THINKING_LEVEL accepts xhigh (Hydrogen; other models use high). SDKs without an xhigh level fall back to high
 v0.1.4
 - Fix: follow-up image edits attach the previous image to the new user message (a model-turn replay was ignored by gemini-nano-banana-2.1)
 - New: Native PDFs toggle filter and NATIVE_PDF_DEFAULT valve; FILES_API description corrected
@@ -520,7 +523,11 @@ class Pipe:
 
     # Capability pins applied between the derived defaults and the admin's
     # MODEL_CAPABILITY_OVERRIDES valve: {model-name pattern: {key: value}}.
-    MODEL_CAPABILITY_PINS: Dict[str, dict] = {}
+    MODEL_CAPABILITY_PINS: Dict[str, dict] = {
+        # Google's thinking page (2026-11-16): Hydrogen takes xhigh on top of
+        # low/medium/high, and rejects minimal. Carbon and Argon stop at high.
+        "gemini-4-hydrogen*": {"thinking_levels": ["low", "medium", "high", "xhigh"]},
+    }
 
     class Valves(BaseModel):
         GEMINI_API_KEY: EncryptedStr = Field(
@@ -625,9 +632,9 @@ class Pipe:
             default="",
             description="Overrides the admin-configured API key; empty = use the admin key. Stored encrypted when WEBUI_SECRET_KEY is set",
         )
-        THINKING_LEVEL: Literal["auto", "minimal", "low", "medium", "high"] = Field(
+        THINKING_LEVEL: Literal["auto", "minimal", "low", "medium", "high", "xhigh"] = Field(
             default="auto",
-            description="Thinking level for models that use levels; auto follows the model default",
+            description="Thinking level for models that use levels; auto follows the model default. xhigh is Gemini 4 Hydrogen only (other models use high)",
         )
         THINKING_BUDGET: int = Field(
             default=-1,

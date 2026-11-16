@@ -4,7 +4,7 @@ id: gemini_pipe
 author: AliD101v
 github: https://github.com/AliD101v/openwebui_google_api_pipe
 description: Google Gemini models via the native Gemini API: optional Google Search and Maps grounding with citations, thinking display, OpenWebUI tools, native files and YouTube, image generation, and usage/cost stats.
-version: 0.1.4
+version: 0.1.5
 license: MIT
 requirements: google-genai>=1.68.0, pydantic>=2.0.0, cryptography
 environment_variables:
@@ -21,6 +21,9 @@ Supports:
 - Encrypted API keys (admin and per-user), store=false by default
 
 Changelog:
+v0.1.5
+- New: Gemini 4 Hydrogen and Gemini 4 Carbon. Hydrogen thinks at low/medium/high/xhigh (default high, no minimal); Carbon at low/medium/high (default medium). Cost: Hydrogen $1.50 / $7.50 per 1M tokens (cache $0.075), Carbon $2 / $10 (cache $0.10) through 2026-11-30 and $4 / $20 (cache $0.20) from 2026-12-01; neither has a long-context tier
+- New: THINKING_LEVEL accepts xhigh (Hydrogen; other models use high). SDKs without an xhigh level fall back to high
 v0.1.4
 - Fix: follow-up image edits attach the previous image to the new user message (a model-turn replay was ignored by gemini-nano-banana-2.1)
 - New: Native PDFs toggle filter and NATIVE_PDF_DEFAULT valve; FILES_API description corrected
@@ -863,6 +866,12 @@ _ARGON_TIERS = [
     {"from": "2026-12-01", "input": 4.00, "output": 20.00, "cache_read": 0.20},
 ]
 
+_CARBON_TIERS = _ARGON_TIERS
+
+_HYDROGEN_TIERS = [
+    {"from": "2026-01-01", "input": 1.50, "output": 7.50, "cache_read": 0.075},
+]
+
 _FLASH_3X_TIERS = [
     {"from": "2026-01-01", "input": 0.75, "output": 3.75, "cache_read": 0.075},
     {"from": "2027-01-01", "input": 1.50, "output": 7.50, "cache_read": 0.15},
@@ -879,6 +888,10 @@ def _single_tier(from_date, input_rate, output_rate, cache_rate, **extra):
     return [tier]
 
 GEMINI_PRICES: dict = {
+    "gemini-4-carbon": _CARBON_TIERS,
+    "gemini-4-carbon*": _CARBON_TIERS,
+    "gemini-4-hydrogen": _HYDROGEN_TIERS,
+    "gemini-4-hydrogen*": _HYDROGEN_TIERS,
     "gemini-4-argon": _ARGON_TIERS,
     "gemini-4-argon*": _ARGON_TIERS,
     "gemini-3.8-flash": _FLASH_3X_TIERS,
@@ -1033,7 +1046,10 @@ class Pipe:
     _resolved_url_cache: Dict[str, str] = {}
     _gemini_file_cache: Dict[str, dict] = {}
 
-    MODEL_CAPABILITY_PINS: Dict[str, dict] = {}
+    MODEL_CAPABILITY_PINS: Dict[str, dict] = {
+
+        "gemini-4-hydrogen*": {"thinking_levels": ["low", "medium", "high", "xhigh"]},
+    }
 
     class Valves(BaseModel):
         GEMINI_API_KEY: EncryptedStr = Field(
@@ -1138,9 +1154,9 @@ class Pipe:
             default="",
             description="Overrides the admin-configured API key; empty = use the admin key. Stored encrypted when WEBUI_SECRET_KEY is set",
         )
-        THINKING_LEVEL: Literal["auto", "minimal", "low", "medium", "high"] = Field(
+        THINKING_LEVEL: Literal["auto", "minimal", "low", "medium", "high", "xhigh"] = Field(
             default="auto",
-            description="Thinking level for models that use levels; auto follows the model default",
+            description="Thinking level for models that use levels; auto follows the model default. xhigh is Gemini 4 Hydrogen only (other models use high)",
         )
         THINKING_BUDGET: int = Field(
             default=-1,
@@ -2313,7 +2329,7 @@ class Pipe:
         ctx.turn.functions_offered = bool(decls)
         return decls
 
-    _LEVEL_ORDER = ("minimal", "low", "medium", "high")
+    _LEVEL_ORDER = ("minimal", "low", "medium", "high", "xhigh")
     _EFFORT_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
 
     @classmethod
@@ -2324,14 +2340,32 @@ class Pipe:
         rank = {name: i for i, name in enumerate(cls._LEVEL_ORDER)}
         e = str(effort or "auto").lower()
         if e in ("none", "minimal"):
-            target = 0
-        elif e in ("xhigh", "max", "ultra"):
-            target = len(cls._LEVEL_ORDER)
+            target = rank["minimal"]
+        elif e in ("max", "ultra"):
+            target = rank["xhigh"]
         elif e in rank:
             target = rank[e]
         else:
             return max(allowed, key=lambda level: rank[level])
         return min(allowed, key=lambda level: (abs(rank[level] - target), -rank[level]))
+
+    @classmethod
+    def _thinking_level_member(cls, level: str):
+        order = cls._LEVEL_ORDER
+        members = gtypes.ThinkingLevel.__members__
+        member = members.get(level.upper())
+        if member is not None:
+            return member
+        try:
+            return gtypes.ThinkingLevel(level)
+        except (ValueError, KeyError):
+            pass
+        start = order.index(level) if level in order else len(order)
+        for lower in reversed(order[:start]):
+            member = members.get(lower.upper())
+            if member is not None:
+                return member
+        return members["LOW"]
 
     def _build_thinking_config(
         self, info: dict, user_valves, body: dict, purpose: str = "chat"
@@ -2356,14 +2390,14 @@ class Pipe:
             if task:
                 level = self._clamp_level(info.get("thinking_levels"), "minimal")
                 return gtypes.ThinkingConfig(
-                    thinking_level=gtypes.ThinkingLevel[level.upper()],
+                    thinking_level=self._thinking_level_member(level),
                     include_thoughts=False,
                 )
             if not effort or effort == "auto":
                 return gtypes.ThinkingConfig(include_thoughts=show)
             level = self._clamp_level(info.get("thinking_levels"), effort)
             return gtypes.ThinkingConfig(
-                thinking_level=gtypes.ThinkingLevel[level.upper()],
+                thinking_level=self._thinking_level_member(level),
                 include_thoughts=show,
             )
 
@@ -3768,7 +3802,9 @@ class Pipe:
     )
 
     _STATIC_FALLBACK_MODELS = (
+        "gemini-4-carbon",
         "gemini-4-argon",
+        "gemini-4-hydrogen",
         "gemini-3.8-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
